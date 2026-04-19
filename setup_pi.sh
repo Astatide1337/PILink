@@ -77,7 +77,10 @@ USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6 || true)"
 
 ensure_rust() {
   if have_cmd cargo; then
-    return 0
+    # cargo may exist but rustup may not have a default toolchain configured.
+    if cargo -V >/dev/null 2>&1; then
+      return 0
+    fi
   fi
 
   warn "cargo not found. Attempting to install Rust via rustup (internet required)."
@@ -93,7 +96,12 @@ ensure_rust() {
   # Make cargo available to this script invocation.
   export PATH="$USER_HOME/.cargo/bin:$PATH"
 
+  # Ensure a default toolchain exists (some existing rustup installs can have none configured).
+  sudo -u "$USER_NAME" -H env PATH="$USER_HOME/.cargo/bin:$PATH" rustup toolchain install stable >/dev/null 2>&1 || true
+  sudo -u "$USER_NAME" -H env PATH="$USER_HOME/.cargo/bin:$PATH" rustup default stable >/dev/null 2>&1 || true
+
   have_cmd cargo || die "cargo still missing after rustup install. Check $USER_HOME/.cargo/bin and re-run."
+  cargo -V >/dev/null 2>&1 || die "cargo is present but rustup has no default toolchain. Run: rustup default stable"
 }
 
 log "Using repo: $REPO_DIR"
@@ -190,7 +198,7 @@ ensure_rust
 log "Building release binary (this may take a while on Pi)"
 (
   cd "$REPO_DIR"
-  cargo build --release
+  sudo -u "$USER_NAME" -H env PATH="$USER_HOME/.cargo/bin:$PATH" cargo build --release
 )
 
 BIN="$REPO_DIR/target/release/pilink-backend"
