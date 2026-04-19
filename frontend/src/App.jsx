@@ -51,6 +51,9 @@ export default function App() {
   const [connected, setConnected] = useState(false)
   const pingRef = useRef(null)
   const pongTimeoutRef = useRef(null)
+  const retryDelayRef = useRef(1000)
+  const reconnectTimerRef = useRef(null)
+  const connectRef = useRef(null) // stores connect() so reconnect-now can call it
 
   // ── chat ──
   const [messages, setMessages] = useState([])
@@ -75,6 +78,7 @@ export default function App() {
   const heartbeatRef = useRef(null)
   const localStreamRef = useRef(null)
   const pcsRef = useRef({})       // peerId → RTCPeerConnection
+  const iceQueueRef = useRef({})  // peerId → [RTCIceCandidate] buffered before remoteDescription
   const [remoteStreams, setRemoteStreams] = useState([]) // { id, stream }
 
   // ── ai ──
@@ -97,7 +101,12 @@ export default function App() {
 
   function startPing() {
     stopPing()
-    pingRef.current = setInterval(() => wsSend({ type: 'ping' }), 10000)
+    pingRef.current = setInterval(() => {
+      // Firefox throttles setInterval in background tabs. Don't send pings
+      // from hidden tabs — server-side WS pings keep the TCP alive anyway.
+      if (document.hidden) return
+      wsSend({ type: 'ping' })
+    }, 15000)
     armPongTimeout()
   }
 
@@ -112,11 +121,17 @@ export default function App() {
     }
   }
 
+  // 45 s pong timeout. If the tab is hidden (Firefox throttles timers),
+  // re-arm instead of killing — server pings keep the connection alive.
   function armPongTimeout() {
     if (pongTimeoutRef.current) clearTimeout(pongTimeoutRef.current)
     pongTimeoutRef.current = setTimeout(() => {
+      if (document.hidden) {
+        armPongTimeout() // re-arm, don't kill — server pings hold the line
+        return
+      }
       try { wsRef.current?.close() } catch {}
-    }, 25000)
+    }, 45000)
   }
 
   function sendTyping(isTyping) {
@@ -136,6 +151,7 @@ export default function App() {
 
   function createPC(remotePeerId) {
     if (pcsRef.current[remotePeerId]) pcsRef.current[remotePeerId].close()
+    delete iceQueueRef.current[remotePeerId]
 
     // No STUN/TURN — all peers are on the same LAN.
     const pc = new RTCPeerConnection({ iceServers: [] })
@@ -160,9 +176,11 @@ export default function App() {
 
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState
-      if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+      if (state === 'failed' || state === 'closed') {
         closePeer(remotePeerId)
       }
+      // 'disconnected' is transient on LAN — ICE may recover on its own.
+      // If it doesn't, it moves to 'failed' which we catch above.
     }
 
     pcsRef.current[remotePeerId] = pc
@@ -176,9 +194,18 @@ export default function App() {
     wsSend({ type: 'webrtc:offer', payload: { to: remotePeerId, sdp: offer.sdp } })
   }
 
+  // ICE candidates can arrive before setRemoteDescription completes.
+  // Queue them per-peer and drain after the description is set.
   async function handleOffer({ from, sdp }) {
     const pc = createPC(from)
+    iceQueueRef.current[from] = [] // start queuing
     await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }))
+    // drain queued ICE candidates
+    const queued = iceQueueRef.current[from] || []
+    delete iceQueueRef.current[from]
+    for (const c of queued) {
+      try { await pc.addIceCandidate(c) } catch {}
+    }
     const answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
     wsSend({ type: 'webrtc:answer', payload: { to: from, sdp: answer.sdp } })
@@ -186,19 +213,33 @@ export default function App() {
 
   async function handleAnswer({ from, sdp }) {
     const pc = pcsRef.current[from]
-    if (pc) await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }))
+    if (!pc) return
+    await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }))
+    // drain queued ICE candidates
+    const queued = iceQueueRef.current[from] || []
+    delete iceQueueRef.current[from]
+    for (const c of queued) {
+      try { await pc.addIceCandidate(c) } catch {}
+    }
   }
 
   async function handleIce({ from, candidate }) {
     const pc = pcsRef.current[from]
-    if (pc && candidate) {
-      try { await pc.addIceCandidate(new RTCIceCandidate(candidate)) } catch {}
+    if (!pc || !candidate) return
+    const iceCandidate = new RTCIceCandidate(candidate)
+    if (pc.remoteDescription) {
+      try { await pc.addIceCandidate(iceCandidate) } catch {}
+    } else {
+      // buffer until remoteDescription is set
+      if (!iceQueueRef.current[from]) iceQueueRef.current[from] = []
+      iceQueueRef.current[from].push(iceCandidate)
     }
   }
 
   function closePeer(id) {
     pcsRef.current[id]?.close()
     delete pcsRef.current[id]
+    delete iceQueueRef.current[id]
     setRemoteStreams(prev => prev.filter((p) => p.id !== id))
   }
 
@@ -224,21 +265,38 @@ export default function App() {
     if (!name) return
 
     let alive = true
-    let timer = null
 
     function connect() {
+      // Clear any pending reconnect timer
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
+
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
       const ws = new WebSocket(`${proto}//${location.host}/api/ws`)
       wsRef.current = ws
 
-      ws.onopen = () => setConnected(true)
+      ws.onopen = () => {
+        setConnected(true)
+        retryDelayRef.current = 1000 // reset backoff on success
+        startPing()
+      }
 
       ws.onclose = () => {
         setConnected(false)
         wsRef.current = null
         stopPing()
         if (inVoiceRef.current) cleanupVoiceLocal()
-        if (alive) timer = setTimeout(connect, 3000)
+        // Abort any running AI stream so it doesn't wedge the UI
+        aiAbortRef.current?.abort()
+        if (alive) {
+          // Exponential backoff with ±20% jitter, capped at 30 s
+          const base = retryDelayRef.current
+          const jitter = base * (0.8 + Math.random() * 0.4)
+          reconnectTimerRef.current = setTimeout(connect, jitter)
+          retryDelayRef.current = Math.min(base * 2, 30000)
+        }
       }
 
       ws.onerror = () => {} // onclose fires after
@@ -351,14 +409,39 @@ export default function App() {
             break
         }
       }
-
-      ws.addEventListener('open', startPing)
     }
 
+    connectRef.current = connect
     connect()
-    return () => { alive = false; clearTimeout(timer); stopPing(); wsRef.current?.close() }
+
+    return () => {
+      alive = false
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
+      stopPing()
+      wsRef.current?.close()
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [name])
+
+  // When tab becomes visible after being hidden, send an immediate ping
+  // to fast-detect dead connections (instead of waiting up to 45 s).
+  useEffect(() => {
+    function onVisChange() {
+      if (document.visibilityState === 'visible' && wsRef.current?.readyState === WebSocket.OPEN) {
+        wsSend({ type: 'ping' })
+        // Arm a short timeout — if the server is dead, detect within 10 s
+        if (pongTimeoutRef.current) clearTimeout(pongTimeoutRef.current)
+        pongTimeoutRef.current = setTimeout(() => {
+          try { wsRef.current?.close() } catch {}
+        }, 10000)
+      }
+    }
+    document.addEventListener('visibilitychange', onVisChange)
+    return () => document.removeEventListener('visibilitychange', onVisChange)
+  }, [])
 
   useEffect(() => {
     return () => {
@@ -392,7 +475,7 @@ export default function App() {
   }, [floorHolder])
 
   // Auto-scroll chat
-  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, typingNames])
   useEffect(() => { aiEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [aiChat])
 
   // ── voice actions ──
@@ -497,8 +580,12 @@ export default function App() {
     aiAbortRef.current = ac
     let maxTimer = setTimeout(() => ac.abort(new DOMException('Generation timed out', 'AbortError')), 180000)
     let idleTimer = setTimeout(() => ac.abort(new DOMException('No tokens received from PI', 'AbortError')), 20000)
+
+    // Track whether we've created the AI response bubble yet.
+    // This prevents the "thinking" indicator and partial-error double-bubble.
+    let responseCreated = false
+
     try {
-      // Stream tokens if available.
       const res = await fetch('/api/ai/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -518,6 +605,7 @@ export default function App() {
       // Create the AI message once, then append tokens as they arrive.
       let aiText = ''
       setAiChat(prev => [...prev, { role: 'ai', text: '' }])
+      responseCreated = true
 
       const dec = new TextDecoder()
       let buf = ''
@@ -553,7 +641,20 @@ export default function App() {
       const msg = err?.name === 'AbortError'
         ? (err?.message || 'Request cancelled')
         : `Error: ${err.message}`
-      setAiChat(prev => [...prev, { role: 'ai', text: msg }])
+      // If we already have a partial AI response, append error to it.
+      // Otherwise create a new error bubble.
+      setAiChat(prev => {
+        if (responseCreated) {
+          const last = prev[prev.length - 1]
+          if (last?.role === 'ai') {
+            const next = prev.slice()
+            const errText = last.text ? `${last.text}\n\n⚠ ${msg}` : `⚠ ${msg}`
+            next[next.length - 1] = { ...last, text: errText }
+            return next
+          }
+        }
+        return [...prev, { role: 'ai', text: `⚠ ${msg}` }]
+      })
     } finally {
       clearTimeout(maxTimer)
       clearTimeout(idleTimer)
@@ -565,6 +666,20 @@ export default function App() {
 
   function stopAi() {
     aiAbortRef.current?.abort(new DOMException('Stopped', 'AbortError'))
+  }
+
+  // ── reconnect-now helper (works even when already disconnected) ──
+  function reconnectNow() {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
+    retryDelayRef.current = 1000
+    if (wsRef.current) {
+      try { wsRef.current.close() } catch {}
+    } else if (connectRef.current) {
+      connectRef.current()
+    }
   }
 
   // ── name save helper ──
@@ -806,11 +921,6 @@ export default function App() {
 
             {/* message list */}
             <div className="flex-1 overflow-y-auto scroll-thin px-4 py-3 space-y-2" style={{ minHeight: 0 }}>
-              {typingNames.length > 0 && (
-                <div className="text-xs text-slate-500">
-                  {typingNames.join(', ')} {typingNames.length === 1 ? 'is' : 'are'} typing...
-                </div>
-              )}
               {messages.length === 0 ? (
                 <div className="flex flex-col items-center justify-center h-full text-slate-500 text-sm">
                   <MessageCircle className="h-8 w-8 mb-2 text-slate-600" />
@@ -837,6 +947,12 @@ export default function App() {
                     </button>
                   </div>
                 ))
+              )}
+              {/* typing indicator — at the bottom, just above the scroll anchor */}
+              {typingNames.length > 0 && (
+                <div className="text-xs text-slate-500 italic">
+                  {typingNames.join(', ')} {typingNames.length === 1 ? 'is' : 'are'} typing…
+                </div>
               )}
               <div ref={chatEndRef} />
             </div>
@@ -935,15 +1051,25 @@ export default function App() {
                     <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-slate-500">
                       {m.role === 'user' ? 'You' : 'PI'}
                     </div>
-                    <div className="whitespace-pre-wrap break-words">{m.text}</div>
+                    <div className="whitespace-pre-wrap break-words">
+                      {m.text || (
+                        /* Pulsing dots while waiting for first token */
+                        <span className="inline-flex items-center gap-1">
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse [animation-delay:150ms]" />
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse [animation-delay:300ms]" />
+                        </span>
+                      )}
+                    </div>
                   </div>
                 ))
               )}
-              {aiBusy && (
+              {/* Only show "thinking" before the AI response bubble is created */}
+              {aiBusy && !(aiChat.length > 0 && aiChat[aiChat.length - 1]?.role === 'ai') && (
                 <div className="mr-8 rounded-xl border border-emerald-900/40 bg-emerald-950/20 px-3 py-2.5 text-sm text-emerald-200">
                   <div className="flex items-center gap-2">
                     <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-                    PI is responding…
+                    PI is thinking…
                   </div>
                 </div>
               )}
@@ -1033,9 +1159,7 @@ export default function App() {
           <WifiOff className="inline h-3.5 w-3.5 mr-1.5" />
           Connection lost — reconnecting…
           <button
-            onClick={() => {
-              try { wsRef.current?.close() } catch {}
-            }}
+            onClick={reconnectNow}
             className="ml-3 underline underline-offset-2"
           >
             Reconnect now

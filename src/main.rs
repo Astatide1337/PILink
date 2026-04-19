@@ -609,6 +609,10 @@ async fn ws_upgrade(
 
 /// One WebSocket session. Splits into a send task (channel → WS) and a receive
 /// loop (WS → event handler). Cleans up voice/floor state on disconnect.
+///
+/// Server sends WS-level Ping frames every 20 s. The browser automatically
+/// responds with Pong. If nothing arrives for 45 s the recv task closes —
+/// this catches dead TCP connections that otherwise linger for minutes.
 async fn ws_session(socket: WebSocket, app: AppState) {
     let (sink, mut stream) = socket.split();
     let (tx, rx) = mpsc::unbounded_channel::<String>();
@@ -641,29 +645,53 @@ async fn ws_session(socket: WebSocket, app: AppState) {
         let _ = tx.send(ev("floor:state", json!({"holder": holder})));
     }
 
-    // Task: drain channel → WebSocket sink.
+    // Task: drain channel → WebSocket sink + periodic WS-level Ping.
     let mut send_task = tokio::spawn(async move {
         let mut rx = rx;
         let mut sink = sink;
-        while let Some(msg) = rx.recv().await {
-            if sink.send(WsMsg::Text(msg)).await.is_err() {
-                break;
+        let mut ping_tick = tokio::time::interval(Duration::from_secs(20));
+        ping_tick.tick().await; // consume immediate first tick
+
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Some(m) => {
+                            if sink.send(WsMsg::Text(m)).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break, // channel closed
+                    }
+                }
+                _ = ping_tick.tick() => {
+                    if sink.send(WsMsg::Ping(Vec::new())).await.is_err() {
+                        break; // client unreachable
+                    }
+                }
             }
         }
     });
 
-    // Task: read WebSocket → event handler.
+    // Task: read WebSocket → event handler. 45 s inactivity timeout detects
+    // dead connections even when no application messages are flowing.
     let app2 = app.clone();
     let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(frame)) = stream.next().await {
-            match frame {
-                WsMsg::Text(txt) => {
-                    if let Ok(incoming) = serde_json::from_str::<WsIn>(&txt) {
-                        handle_ws_event(&app2, cid, incoming).await;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(45), stream.next()).await {
+                Ok(Some(Ok(frame))) => match frame {
+                    WsMsg::Text(txt) => {
+                        if let Ok(incoming) = serde_json::from_str::<WsIn>(&txt) {
+                            handle_ws_event(&app2, cid, incoming).await;
+                        }
                     }
-                }
-                WsMsg::Close(_) => break,
-                _ => {}
+                    WsMsg::Close(_) => break,
+                    // Pong / Ping / Binary — any frame resets the 45 s timeout.
+                    _ => {}
+                },
+                Ok(Some(Err(_))) => break, // WS error
+                Ok(None) => break,         // stream ended
+                Err(_) => break,           // 45 s timeout → dead client
             }
         }
     });
