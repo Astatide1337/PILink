@@ -64,6 +64,30 @@ Mobile browsers require HTTPS for microphone access. This project expects:
 - `/etc/pilink/certs/fullchain.pem`
 - `/etc/pilink/certs/privkey.pem`
 
+There are two supported setup tracks:
+
+**A) Bring Your Own Domain (best UX)**
+
+- Use a domain you control (example: `pilink.example.com`).
+- Issue a publicly-trusted certificate via Let's Encrypt (DNS-01 recommended).
+- Configure hotspot DNS so that domain resolves to the node IP (offline).
+
+Pros: no certificate warnings on phones; microphone works without manual trust.
+
+**B) Self-Signed Certificate (no domain required)**
+
+- Generate a self-signed cert on the Pi and install it to `/etc/pilink/certs/`.
+- Phones may require a one-time manual trust step.
+
+Generate:
+
+```bash
+sudo bash ./generate_self_signed_cert.sh --domain pilink.local
+```
+
+Pros: fully offline, no domain needed.
+Cons: manual trust step on clients.
+
 ### 3) Local DNS (offline domain)
 
 When the Pi is the hotspot gateway (`10.42.0.1`), the hotspot DNS must resolve:
@@ -80,11 +104,50 @@ with:
 address=/pilink.astatide.com/10.42.0.1
 ```
 
+If you use a different domain (BYO domain track), update the mapping to your hostname:
+
+```conf
+address=/pilink.example.com/10.42.0.1
+```
+
 Then restart NetworkManager:
 
 ```bash
 sudo systemctl restart NetworkManager
 ```
+
+## One-Command Pi Setup
+
+This repo includes a setup script that configures:
+
+- NetworkManager hotspot profile (`PILink-AP`)
+- Local DNS mapping (`pilink.astatide.com -> 10.42.0.1`)
+- Firewall allowances on the AP interface (best-effort)
+- A `systemd` service (`pilink`) that runs the backend on boot
+
+Run on the Pi from the repo directory:
+
+```bash
+bash setup_pi.sh
+```
+
+If you're not using `pilink.astatide.com`, pass your domain:
+
+```bash
+bash setup_pi.sh --domain pilink.example.com
+```
+
+To activate the hotspot immediately (this may drop SSH):
+
+```bash
+bash setup_pi.sh --activate-ap
+```
+
+After activation:
+
+- SSID: `PILink_Emergency_Node`
+- Gateway IP: `10.42.0.1`
+- URL: `https://pilink.astatide.com`
 
 ### 4) Build and Run
 
