@@ -12,7 +12,7 @@ AP_IP="192.168.4.1"
 AP_CIDR="192.168.4.1/24"
 DHCP_START="192.168.4.50"
 DHCP_END="192.168.4.150"
-SSID="PILink_Emergency_Node"
+SSID="PILink"
 
 if [[ ${EUID:-0} -ne 0 ]]; then
   echo "Run as root: sudo bash forge_network.sh" >&2

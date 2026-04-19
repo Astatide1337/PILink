@@ -145,7 +145,7 @@ bash setup_pi.sh --activate-ap
 
 After activation:
 
-- SSID: `PILink_Emergency_Node`
+- SSID: `PILink`
 - Gateway IP: `10.42.0.1`
 - URL: `https://pilink.astatide.com`
 

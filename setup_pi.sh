@@ -9,7 +9,7 @@ set -euo pipefail
 #
 # Designed to be re-runnable (idempotent) and to fail with actionable guidance.
 
-SSID="PILink_Emergency_Node"
+SSID="PILink"
 PSK="pilinkmesh"
 AP_CON="PILink-AP"
 AP_IF="wlan0"
@@ -35,6 +35,7 @@ Options:
 Examples:
   bash setup_pi.sh --repo ~/PILink
   bash setup_pi.sh --activate-ap
+  bash setup_pi.sh --ssid PILink
 EOF
 }
 
