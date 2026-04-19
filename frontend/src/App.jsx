@@ -74,6 +74,8 @@ export default function App() {
 
   // ── ai ──
   const [aiAvailable, setAiAvailable] = useState(null)
+  const [aiReason, setAiReason] = useState(null)
+  const [aiWant, setAiWant] = useState(null)
   const [aiChat, setAiChat] = useState([])
   const [aiDraft, setAiDraft] = useState('')
   const [aiBusy, setAiBusy] = useState(false)
@@ -374,7 +376,10 @@ export default function App() {
     if (tab !== 'ai') return
     let cancelled = false
     fetch('/api/ai/health').then(r => r.json()).then(d => {
-      if (!cancelled) setAiAvailable(d.available)
+      if (cancelled) return
+      setAiAvailable(Boolean(d.available))
+      setAiReason(d.reason || null)
+      setAiWant(d.want || null)
     }).catch(() => { if (!cancelled) setAiAvailable(false) })
     return () => { cancelled = true }
   }, [tab])
@@ -387,12 +392,14 @@ export default function App() {
     setAiDraft('')
     setAiChat(prev => [...prev, { role: 'user', text: q }])
 
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort(), 60000)
     try {
       const res = await fetch('/api/ai', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: q }),
-        signal: AbortSignal.timeout(60000),
+        signal: ac.signal,
       })
       const data = await res.json()
       if (data.error) throw new Error(data.error)
@@ -400,6 +407,7 @@ export default function App() {
     } catch (err) {
       setAiChat(prev => [...prev, { role: 'ai', text: `Error: ${err.message}` }])
     } finally {
+      clearTimeout(timer)
       setAiBusy(false)
     }
   }
@@ -533,7 +541,7 @@ export default function App() {
                 : 'text-slate-400 hover:text-slate-200 border border-transparent'
             )}
           >
-            <Bot className="h-3.5 w-3.5" /> AI
+            <Bot className="h-3.5 w-3.5" /> PI
           </button>
         </div>
       </header>
@@ -700,7 +708,7 @@ export default function App() {
             <div className="border-b border-slate-800 px-4 py-3 flex items-center justify-between">
               <div className="flex items-center gap-2 text-xs">
                 <Bot className="h-4 w-4 text-emerald-400" />
-                <span className="font-medium text-slate-200">Survival Expert</span>
+                <span className="font-medium text-slate-200">PI</span>
               </div>
               <div className="flex items-center gap-1.5 text-[11px]">
                 {aiAvailable === null ? (
@@ -724,9 +732,33 @@ export default function App() {
               {aiChat.length === 0 ? (
                 <div className="flex flex-col items-center justify-center h-full text-slate-500 text-sm text-center px-6">
                   <Bot className="h-8 w-8 mb-2 text-slate-600" />
-                  <p>Ask about water purification, first aid, shelter, navigation, signaling, or triage.</p>
-                  {aiAvailable === false && (
-                    <p className="mt-2 text-amber-400 text-xs">AI model is not running. Responses will fail until Ollama is started.</p>
+                  <p>Ask PI anything. PI also knows how PILink works and can help troubleshoot.</p>
+                  <div className="mt-3 grid w-full max-w-sm gap-2">
+                    {[
+                      'Why is my voice channel not working on iPhone?',
+                      'How can I improve PILink range?',
+                      'Summarize the last few messages.',
+                      'Draft a calm announcement for the group.',
+                    ].map((s) => (
+                      <button
+                        key={s}
+                        onClick={() => setAiDraft(s)}
+                        className="rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-2 text-left text-xs text-slate-300 hover:border-slate-700"
+                      >
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+
+                  {aiAvailable === false && aiReason === 'model_missing' && aiWant && (
+                    <div className="mt-3 w-full max-w-sm rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-left text-xs text-amber-300">
+                      Model missing. On the Pi run: <span className="text-amber-200">ollama pull {aiWant}</span>
+                    </div>
+                  )}
+                  {aiAvailable === false && aiReason === 'ollama_down' && (
+                    <div className="mt-3 w-full max-w-sm rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-left text-xs text-amber-300">
+                      Ollama is offline on this node. On the Pi run: <span className="text-amber-200">sudo systemctl start ollama</span>
+                    </div>
                   )}
                 </div>
               ) : (
@@ -741,7 +773,7 @@ export default function App() {
                     )}
                   >
                     <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-slate-500">
-                      {m.role === 'user' ? 'You' : 'Survival Expert'}
+                      {m.role === 'user' ? 'You' : 'PI'}
                     </div>
                     <div className="whitespace-pre-wrap break-words">{m.text}</div>
                   </div>

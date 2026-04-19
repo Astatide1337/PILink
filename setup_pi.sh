@@ -15,6 +15,7 @@ AP_CON="PILink-AP"
 AP_IF="wlan0"
 AP_IP="10.42.0.1/24"
 DOMAIN="pilink.astatide.com"
+OLLAMA_MODEL="qwen2:0.5b"
 REPO_DIR="$(pwd)"
 ACTIVATE_AP=0
 
@@ -29,6 +30,7 @@ Options:
   --psk <pass>         Hotspot WPA2 password (default: pilinkmesh)
   --ip <cidr>          AP gateway address (default: 10.42.0.1/24)
   --domain <name>      Local domain to map to AP IP (default: pilink.astatide.com)
+  --ollama-model <m>   Ollama model to use/pull (default: qwen2:0.5b)
   --activate-ap        Bring up the AP at the end (may drop SSH)
   -h, --help           Show help
 
@@ -59,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --psk) PSK="$2"; shift 2;;
     --ip) AP_IP="$2"; shift 2;;
     --domain) DOMAIN="$2"; shift 2;;
+    --ollama-model) OLLAMA_MODEL="$2"; shift 2;;
     --activate-ap) ACTIVATE_AP=1; shift;;
     -h|--help) usage; exit 0;;
     *) die "Unknown arg: $1 (use --help)";;
@@ -111,6 +114,7 @@ log "Using repo: $REPO_DIR"
 log "AP connection: $AP_CON on $AP_IF ($AP_IP)"
 log "SSID: $SSID"
 log "Domain map: $DOMAIN -> ${AP_IP%/*}"
+log "Ollama model: $OLLAMA_MODEL"
 
 log "Step 1/6: Validate TLS certs (for HTTPS + microphone)"
 if [[ ! -f /etc/pilink/certs/fullchain.pem || ! -f /etc/pilink/certs/privkey.pem ]]; then
@@ -236,6 +240,7 @@ User=$USER_NAME
 SupplementaryGroups=pilink
 WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info
+Environment=PILINK_OLLAMA_MODEL=$OLLAMA_MODEL
 ExecStart=$BIN
 Restart=always
 RestartSec=2
@@ -252,6 +257,22 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable pilink
 sudo systemctl restart pilink
+
+log "Ollama setup (best-effort)"
+if command -v ollama >/dev/null 2>&1; then
+  sudo systemctl enable ollama 2>/dev/null || true
+  sudo systemctl start ollama 2>/dev/null || true
+  if command -v curl >/dev/null 2>&1 && curl -fsS "http://127.0.0.1:11434/api/tags" >/dev/null 2>&1; then
+    if ! ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$OLLAMA_MODEL"; then
+      warn "Ollama model '$OLLAMA_MODEL' not found. Attempting: ollama pull $OLLAMA_MODEL"
+      ollama pull "$OLLAMA_MODEL" || warn "ollama pull failed (internet required). AI tab will show model missing."
+    fi
+  else
+    warn "Ollama API not responding on 127.0.0.1:11434. AI tab will show unavailable."
+  fi
+else
+  warn "ollama not installed. Install it (internet required): curl -fsSL https://ollama.com/install.sh | sh"
+fi
 
 log "Service status (last lines):"
 sudo systemctl --no-pager --full status pilink | sed -n '1,16p' || true

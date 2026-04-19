@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    env,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -28,12 +29,8 @@ const TLS_CERT: &str = "/etc/pilink/certs/fullchain.pem";
 const TLS_KEY: &str = "/etc/pilink/certs/privkey.pem";
 const HTTPS_HOST: &str = "pilink.astatide.com";
 const OLLAMA_URL: &str = "http://127.0.0.1:11434";
-const OLLAMA_MODEL: &str = "qwen2:0.5b";
-const SYSTEM_PROMPT: &str = "\
-    You are a Disaster Survival Expert. Give concise, practical, step-by-step \
-    advice for emergencies. Prioritize safety, triage, shelter, water, food, \
-    first aid, and communication. If details are missing, ask 1-2 clarifying \
-    questions. Avoid speculation and do not mention being an AI.";
+const DEFAULT_OLLAMA_MODEL: &str = "qwen2:0.5b";
+const SYSTEM_PROMPT: &str = "You are PI, a helpful on-device assistant inside PILink, created by Soham Bhagat. You answer any question concisely and clearly. You also understand PILink (local Wi-Fi bubble, real-time chat, push-to-talk voice channel, offline-first) and can help troubleshoot it. If the user asks something ambiguous, ask 1-2 clarifying questions. Do not claim end-to-end encryption; the security boundary is the local Wi-Fi password and local-only networking.";
 
 // ── types ──────────────────────────────────────────────────────────────────────
 
@@ -64,6 +61,10 @@ struct AiResponse {
 #[derive(Serialize)]
 struct AiHealth {
     available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    want: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -82,6 +83,17 @@ struct OllamaReq<'a> {
 #[derive(Deserialize)]
 struct OllamaRes {
     response: String,
+}
+
+#[derive(Deserialize)]
+struct OllamaTags {
+    #[serde(default)]
+    models: Vec<OllamaTagModel>,
+}
+
+#[derive(Deserialize)]
+struct OllamaTagModel {
+    name: String,
 }
 
 /// Incoming WebSocket event envelope.
@@ -116,6 +128,7 @@ struct AppState {
     clients: Arc<RwLock<HashMap<Uuid, WsClient>>>,
     voice: Arc<RwLock<VoiceState>>,
     http: reqwest::Client,
+    ollama_model: String,
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────
@@ -171,6 +184,8 @@ async fn main() {
         .install_default()
         .expect("install rustls crypto provider");
 
+    let ollama_model = env::var("PILINK_OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
+
     let app = AppState {
         msgs: Arc::new(RwLock::new(Vec::new())),
         clients: Arc::new(RwLock::new(HashMap::new())),
@@ -182,6 +197,7 @@ async fn main() {
             .timeout(Duration::from_secs(60))
             .build()
             .expect("http client"),
+        ollama_model,
     };
 
     // Background: expire floor lease every second.
@@ -329,7 +345,7 @@ async fn ai(State(app): State<AppState>, Json(req): Json<AiRequest>) -> impl Int
     }
 
     let body = OllamaReq {
-        model: OLLAMA_MODEL,
+        model: &app.ollama_model,
         prompt: &q,
         system: SYSTEM_PROMPT,
         stream: false,
@@ -355,6 +371,13 @@ async fn ai(State(app): State<AppState>, Json(req): Json<AiRequest>) -> impl Int
     };
 
     if !res.status().is_success() {
+        if res.status() == StatusCode::NOT_FOUND {
+            let msg = format!(
+                "model '{}' not installed on this node. Fix: ollama pull {}",
+                app.ollama_model, app.ollama_model
+            );
+            return (StatusCode::BAD_GATEWAY, Json(ErrBody { error: msg })).into_response();
+        }
         return (
             StatusCode::BAD_GATEWAY,
             Json(ErrBody {
@@ -377,15 +400,54 @@ async fn ai(State(app): State<AppState>, Json(req): Json<AiRequest>) -> impl Int
 }
 
 async fn ai_health(State(app): State<AppState>) -> Json<AiHealth> {
-    let available = app
+    let want = app.ollama_model.clone();
+
+    let res = app
         .http
-        .get(format!("{OLLAMA_URL}/"))
+        .get(format!("{OLLAMA_URL}/api/tags"))
         .timeout(Duration::from_secs(3))
         .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-    Json(AiHealth { available })
+        .await;
+
+    let Ok(res) = res else {
+        return Json(AiHealth {
+            available: false,
+            reason: Some("ollama_down".to_string()),
+            want: Some(want),
+        });
+    };
+
+    if !res.status().is_success() {
+        return Json(AiHealth {
+            available: false,
+            reason: Some("ollama_down".to_string()),
+            want: Some(want),
+        });
+    }
+
+    let tags = res.json::<OllamaTags>().await;
+    let Ok(tags) = tags else {
+        return Json(AiHealth {
+            available: false,
+            reason: Some("ollama_down".to_string()),
+            want: Some(want),
+        });
+    };
+
+    let has_model = tags.models.iter().any(|m| m.name == want);
+    if has_model {
+        Json(AiHealth {
+            available: true,
+            reason: None,
+            want: None,
+        })
+    } else {
+        Json(AiHealth {
+            available: false,
+            reason: Some("model_missing".to_string()),
+            want: Some(want),
+        })
+    }
 }
 
 // ── WebSocket ──────────────────────────────────────────────────────────────────
