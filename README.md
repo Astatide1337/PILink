@@ -131,6 +131,11 @@ Run on the Pi from the repo directory:
 bash setup_pi.sh
 ```
 
+Recommended workflow:
+
+1) Run `bash setup_pi.sh` while the Pi is on a network with internet (so Rust can install/build).
+2) Then run `bash setup_pi.sh --activate-ap` to switch into hotspot mode.
+
 If you're not using `pilink.astatide.com`, pass your domain:
 
 ```bash

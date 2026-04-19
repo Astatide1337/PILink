@@ -47,6 +47,10 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing '$1'. Install it and re-run.";
 }
 
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo) REPO_DIR="$2"; shift 2;;
@@ -70,6 +74,27 @@ need_cmd systemctl
 USER_NAME="${SUDO_USER:-$USER}"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6 || true)"
 [[ -n "$USER_HOME" ]] || USER_HOME="/home/$USER_NAME"
+
+ensure_rust() {
+  if have_cmd cargo; then
+    return 0
+  fi
+
+  warn "cargo not found. Attempting to install Rust via rustup (internet required)."
+  if ! have_cmd curl; then
+    die "Missing 'curl'. Install curl (or copy rustup-init offline), then re-run."
+  fi
+
+  # Install rustup for the non-root user even if script is run with sudo.
+  sudo -u "$USER_NAME" -H sh -c 'set -e; curl -fsSL https://sh.rustup.rs | sh -s -- -y' || {
+    die "rustup install failed. Ensure the Pi has internet access, then re-run setup_pi.sh."
+  }
+
+  # Make cargo available to this script invocation.
+  export PATH="$USER_HOME/.cargo/bin:$PATH"
+
+  have_cmd cargo || die "cargo still missing after rustup install. Check $USER_HOME/.cargo/bin and re-run."
+}
 
 log "Using repo: $REPO_DIR"
 log "AP connection: $AP_CON on $AP_IF ($AP_IP)"
@@ -132,8 +157,7 @@ if sudo test -d "$DNS_DIR2"; then
   log "Wrote $TARGET2"
 fi
 
-log "Restarting NetworkManager to apply DNS overrides"
-sudo systemctl restart NetworkManager
+log "Note: NetworkManager restart will happen at the end"
 
 log "Step 4/6: Open required ports on AP interface (best-effort)"
 if command -v iptables >/dev/null 2>&1; then
@@ -161,7 +185,7 @@ else
 fi
 
 log "Step 5/6: Build backend and install systemd service"
-need_cmd cargo
+ensure_rust
 
 log "Building release binary (this may take a while on Pi)"
 (
@@ -212,6 +236,10 @@ log "Service status (last lines):"
 sudo systemctl --no-pager --full status pilink | sed -n '1,16p' || true
 
 log "Step 6/6: Optionally activate hotspot"
+
+log "Restarting NetworkManager to apply DNS overrides"
+sudo systemctl restart NetworkManager
+
 if [[ "$ACTIVATE_AP" -eq 1 ]]; then
   warn "Bringing up '$AP_CON' may drop your SSH session."
   warn "Reconnect SSID: $SSID  IP: ${AP_IP%/*}  URL: https://$DOMAIN"
