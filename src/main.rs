@@ -165,6 +165,12 @@ async fn broadcast_floor(app: &AppState) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // rustls 0.23+ requires an explicit crypto provider selection.
+    // We pick ring for broad compatibility and low friction on Raspberry Pi.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls crypto provider");
+
     let app = AppState {
         msgs: Arc::new(RwLock::new(Vec::new())),
         clients: Arc::new(RwLock::new(HashMap::new())),

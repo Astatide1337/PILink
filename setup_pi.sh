@@ -120,6 +120,15 @@ if [[ ! -f /etc/pilink/certs/fullchain.pem || ! -f /etc/pilink/certs/privkey.pem
   warn "Fix: issue a cert for $DOMAIN (Let's Encrypt DNS-01) and install into /etc/pilink/certs/."
 else
   log "TLS certs present."
+
+  # Ensure the service user can read the private key.
+  # Default is root:root 600, which breaks non-root services.
+  if ! getent group pilink >/dev/null 2>&1; then
+    sudo groupadd --system pilink 2>/dev/null || true
+  fi
+  sudo chgrp pilink /etc/pilink/certs/privkey.pem 2>/dev/null || true
+  sudo chmod 640 /etc/pilink/certs/privkey.pem 2>/dev/null || true
+  sudo chmod 755 /etc/pilink/certs 2>/dev/null || true
 fi
 
 log "Step 2/6: Ensure NetworkManager hotspot profile exists"
@@ -224,6 +233,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$USER_NAME
+SupplementaryGroups=pilink
 WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info
 ExecStart=$BIN
