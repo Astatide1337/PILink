@@ -56,6 +56,9 @@ export default function App() {
   const [messages, setMessages] = useState([])
   const [draft, setDraft] = useState('')
   const chatEndRef = useRef(null)
+  const [typingNames, setTypingNames] = useState([])
+  const typingStopRef = useRef(null)
+  const typingSeenRef = useRef({})
 
   // ── identity ──
   const [peerId, setPeerId] = useState(null)
@@ -94,7 +97,7 @@ export default function App() {
 
   function startPing() {
     stopPing()
-    pingRef.current = setInterval(() => wsSend({ type: 'ping' }), 20000)
+    pingRef.current = setInterval(() => wsSend({ type: 'ping' }), 10000)
     armPongTimeout()
   }
 
@@ -113,7 +116,11 @@ export default function App() {
     if (pongTimeoutRef.current) clearTimeout(pongTimeoutRef.current)
     pongTimeoutRef.current = setTimeout(() => {
       try { wsRef.current?.close() } catch {}
-    }, 45000)
+    }, 25000)
+  }
+
+  function sendTyping(isTyping) {
+    wsSend({ type: 'typing', payload: { name, typing: isTyping } })
   }
 
   function startHeartbeat() {
@@ -265,6 +272,28 @@ export default function App() {
             setMessages([])
             break
 
+          case 'typing': {
+            const who = data.payload?.name
+            const isTyping = Boolean(data.payload?.typing)
+            if (!who || who === name) break
+
+            if (isTyping) {
+              setTypingNames(prev => (prev.includes(who) ? prev : [...prev, who]))
+              if (typingSeenRef.current[who]) clearTimeout(typingSeenRef.current[who])
+              typingSeenRef.current[who] = setTimeout(() => {
+                setTypingNames(prev => prev.filter(n => n !== who))
+                delete typingSeenRef.current[who]
+              }, 3500)
+            } else {
+              setTypingNames(prev => prev.filter(n => n !== who))
+              if (typingSeenRef.current[who]) {
+                clearTimeout(typingSeenRef.current[who])
+                delete typingSeenRef.current[who]
+              }
+            }
+            break
+          }
+
           case 'voice:peers':
             setVoicePeers(data.payload || [])
             break
@@ -330,6 +359,13 @@ export default function App() {
     return () => { alive = false; clearTimeout(timer); stopPing(); wsRef.current?.close() }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [name])
+
+  useEffect(() => {
+    return () => {
+      if (typingStopRef.current) clearTimeout(typingStopRef.current)
+      Object.values(typingSeenRef.current).forEach(clearTimeout)
+    }
+  }, [])
 
   // ── Mute/unmute remote audio based on floor holder ──
 
@@ -406,7 +442,23 @@ export default function App() {
     const text = draft.trim()
     if (!text) return
     wsSend({ type: 'message:send', payload: { sender: name, content: text } })
+    sendTyping(false)
+    if (typingStopRef.current) {
+      clearTimeout(typingStopRef.current)
+      typingStopRef.current = null
+    }
     setDraft('')
+  }
+
+  function onDraftChange(value) {
+    setDraft(value)
+    sendTyping(Boolean(value.trim()))
+    if (typingStopRef.current) clearTimeout(typingStopRef.current)
+    if (value.trim()) {
+      typingStopRef.current = setTimeout(() => sendTyping(false), 1800)
+    } else {
+      typingStopRef.current = null
+    }
   }
 
   function deleteMessage(id) {
@@ -754,6 +806,11 @@ export default function App() {
 
             {/* message list */}
             <div className="flex-1 overflow-y-auto scroll-thin px-4 py-3 space-y-2" style={{ minHeight: 0 }}>
+              {typingNames.length > 0 && (
+                <div className="text-xs text-slate-500">
+                  {typingNames.join(', ')} {typingNames.length === 1 ? 'is' : 'are'} typing...
+                </div>
+              )}
               {messages.length === 0 ? (
                 <div className="flex flex-col items-center justify-center h-full text-slate-500 text-sm">
                   <MessageCircle className="h-8 w-8 mb-2 text-slate-600" />
@@ -788,7 +845,7 @@ export default function App() {
             <form onSubmit={sendMessage} className="border-t border-slate-800 px-4 py-3 flex gap-2">
               <input
                 value={draft}
-                onChange={e => setDraft(e.target.value)}
+                onChange={e => onDraftChange(e.target.value)}
                 placeholder="Type a message…"
                 maxLength={600}
                 className="flex-1 rounded-xl border border-slate-700 bg-slate-900 px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 outline-none focus:border-emerald-600 focus:ring-1 focus:ring-emerald-600/40"

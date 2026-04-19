@@ -86,6 +86,7 @@ struct OllamaReq<'a> {
     system: &'a str,
     stream: bool,
     options: OllamaOptions,
+    keep_alive: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -236,7 +237,7 @@ async fn main() {
             floor: None,
         })),
         http: reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(180))
             .build()
             .expect("http client"),
         ollama_model,
@@ -392,7 +393,8 @@ async fn ai(State(app): State<AppState>, Json(req): Json<AiRequest>) -> impl Int
         prompt: &q,
         system: SYSTEM_PROMPT,
         stream: false,
-        options: OllamaOptions { num_predict: 220 },
+        options: OllamaOptions { num_predict: 140 },
+        keep_alive: "30m",
     };
 
     let res = match app
@@ -460,7 +462,8 @@ async fn ai_stream(State(app): State<AppState>, Json(req): Json<AiStreamRequest>
         prompt: &q,
         system: SYSTEM_PROMPT,
         stream: true,
-        options: OllamaOptions { num_predict: 220 },
+        options: OllamaOptions { num_predict: 140 },
+        keep_alive: "30m",
     };
 
     let res = match app
@@ -744,6 +747,33 @@ async fn handle_ws_event(app: &AppState, cid: Uuid, e: WsIn) {
         "chat:clear" => {
             app.msgs.write().await.clear();
             broadcast(&app.clients, &ev0("chat:clear")).await;
+        }
+
+        "typing" => {
+            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+            let is_typing = p.get("typing").and_then(|v| v.as_bool()).unwrap_or(false);
+            if name.is_empty() {
+                return;
+            }
+            let msg = ev("typing", json!({"id": cid, "name": name, "typing": is_typing}));
+            let mut dead: Vec<Uuid> = Vec::new();
+            {
+                let map = app.clients.read().await;
+                for (id, c) in map.iter() {
+                    if *id == cid {
+                        continue;
+                    }
+                    if c.tx.send(msg.clone()).is_err() {
+                        dead.push(*id);
+                    }
+                }
+            }
+            if !dead.is_empty() {
+                let mut map = app.clients.write().await;
+                for id in dead {
+                    map.remove(&id);
+                }
+            }
         }
 
         // ── voice presence ─────────────────────────────────────────────────
