@@ -50,6 +50,7 @@ export default function App() {
   const wsRef = useRef(null)
   const [connected, setConnected] = useState(false)
   const pingRef = useRef(null)
+  const pongTimeoutRef = useRef(null)
 
   // ── chat ──
   const [messages, setMessages] = useState([])
@@ -71,7 +72,7 @@ export default function App() {
   const heartbeatRef = useRef(null)
   const localStreamRef = useRef(null)
   const pcsRef = useRef({})       // peerId → RTCPeerConnection
-  const audiosRef = useRef({})    // peerId → HTMLAudioElement
+  const [remoteStreams, setRemoteStreams] = useState([]) // { id, stream }
 
   // ── ai ──
   const [aiAvailable, setAiAvailable] = useState(null)
@@ -80,7 +81,9 @@ export default function App() {
   const [aiChat, setAiChat] = useState([])
   const [aiDraft, setAiDraft] = useState('')
   const [aiBusy, setAiBusy] = useState(false)
+  const [aiStreaming, setAiStreaming] = useState(false)
   const aiEndRef = useRef(null)
+  const aiAbortRef = useRef(null)
 
   // ── helpers ──
   function wsSend(data) {
@@ -92,6 +95,7 @@ export default function App() {
   function startPing() {
     stopPing()
     pingRef.current = setInterval(() => wsSend({ type: 'ping' }), 20000)
+    armPongTimeout()
   }
 
   function stopPing() {
@@ -99,6 +103,17 @@ export default function App() {
       clearInterval(pingRef.current)
       pingRef.current = null
     }
+    if (pongTimeoutRef.current) {
+      clearTimeout(pongTimeoutRef.current)
+      pongTimeoutRef.current = null
+    }
+  }
+
+  function armPongTimeout() {
+    if (pongTimeoutRef.current) clearTimeout(pongTimeoutRef.current)
+    pongTimeoutRef.current = setTimeout(() => {
+      try { wsRef.current?.close() } catch {}
+    }, 45000)
   }
 
   function startHeartbeat() {
@@ -123,17 +138,23 @@ export default function App() {
     }
 
     pc.ontrack = (e) => {
-      const audio = new Audio()
-      audio.srcObject = e.streams[0]
-      const holder = floorHolderRef.current
-      audio.muted = !holder || holder.id !== remotePeerId
-      audio.play().catch(() => {})
-      audiosRef.current[remotePeerId] = audio
+      const stream = e.streams[0]
+      setRemoteStreams(prev => {
+        const rest = prev.filter((p) => p.id !== remotePeerId)
+        return [...rest, { id: remotePeerId, stream }]
+      })
     }
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
         wsSend({ type: 'webrtc:ice', payload: { to: remotePeerId, candidate: e.candidate.toJSON() } })
+      }
+    }
+
+    pc.onconnectionstatechange = () => {
+      const state = pc.connectionState
+      if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+        closePeer(remotePeerId)
       }
     }
 
@@ -171,8 +192,7 @@ export default function App() {
   function closePeer(id) {
     pcsRef.current[id]?.close()
     delete pcsRef.current[id]
-    const a = audiosRef.current[id]
-    if (a) { a.pause(); a.srcObject = null; delete audiosRef.current[id] }
+    setRemoteStreams(prev => prev.filter((p) => p.id !== id))
   }
 
   function cleanupVoiceLocal() {
@@ -188,6 +208,7 @@ export default function App() {
     setVoicePeers([])
     setFloorHolder(null)
     floorHolderRef.current = null
+    setRemoteStreams([])
   }
 
   // ── WebSocket connection ──
@@ -221,6 +242,7 @@ export default function App() {
 
         switch (data.type) {
           case 'pong':
+            armPongTimeout()
             break
           case 'self:id':
             peerIdRef.current = data.payload.id
@@ -252,7 +274,9 @@ export default function App() {
           case 'voice:joined':
             if (inVoiceRef.current && Array.isArray(data.payload)) {
               for (const peer of data.payload) {
-                connectToPeer(peer.id).catch(() => {})
+                if (peerIdRef.current && String(peerIdRef.current) < String(peer.id)) {
+                  connectToPeer(peer.id).catch(() => {})
+                }
               }
             }
             break
@@ -310,9 +334,7 @@ export default function App() {
   // ── Mute/unmute remote audio based on floor holder ──
 
   useEffect(() => {
-    Object.entries(audiosRef.current).forEach(([id, audio]) => {
-      audio.muted = !floorHolder || floorHolder.id !== id
-    })
+    setRemoteStreams(prev => [...prev])
   }, [floorHolder])
 
   // When floor is granted to us and we're still pressing PTT, enable mic.
@@ -415,11 +437,14 @@ export default function App() {
     const q = aiDraft.trim()
     if (!q || aiBusy) return
     setAiBusy(true)
+    setAiStreaming(true)
     setAiDraft('')
     setAiChat(prev => [...prev, { role: 'user', text: q }])
 
     const ac = new AbortController()
-    const timer = setTimeout(() => ac.abort(), 60000)
+    aiAbortRef.current = ac
+    let maxTimer = setTimeout(() => ac.abort(new DOMException('Generation timed out', 'AbortError')), 180000)
+    let idleTimer = setTimeout(() => ac.abort(new DOMException('No tokens received from PI', 'AbortError')), 20000)
     try {
       // Stream tokens if available.
       const res = await fetch('/api/ai/stream', {
@@ -447,6 +472,8 @@ export default function App() {
       while (true) {
         const { value, done } = await reader.read()
         if (done) break
+        clearTimeout(idleTimer)
+        idleTimer = setTimeout(() => ac.abort(new DOMException('PI stopped responding', 'AbortError')), 20000)
         buf += dec.decode(value, { stream: true })
 
         let idx
@@ -471,11 +498,21 @@ export default function App() {
         }
       }
     } catch (err) {
-      setAiChat(prev => [...prev, { role: 'ai', text: `Error: ${err.message}` }])
+      const msg = err?.name === 'AbortError'
+        ? (err?.message || 'Request cancelled')
+        : `Error: ${err.message}`
+      setAiChat(prev => [...prev, { role: 'ai', text: msg }])
     } finally {
-      clearTimeout(timer)
+      clearTimeout(maxTimer)
+      clearTimeout(idleTimer)
+      aiAbortRef.current = null
       setAiBusy(false)
+      setAiStreaming(false)
     }
+  }
+
+  function stopAi() {
+    aiAbortRef.current?.abort(new DOMException('Stopped', 'AbortError'))
   }
 
   // ── name save helper ──
@@ -525,7 +562,7 @@ export default function App() {
           </button>
           <p className="mt-4 text-[11px] text-slate-500 text-center leading-relaxed">
             If pilink.astatide.com doesn't load, try{' '}
-            <span className="text-slate-400">https://10.42.0.1</span>
+            <span className="text-slate-400">disable Private DNS / DoH and reload</span>
           </p>
         </div>
       </div>
@@ -849,7 +886,7 @@ export default function App() {
                 <div className="mr-8 rounded-xl border border-emerald-900/40 bg-emerald-950/20 px-3 py-2.5 text-sm text-emerald-200">
                   <div className="flex items-center gap-2">
                     <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-                    Thinking…
+                    PI is responding…
                   </div>
                 </div>
               )}
@@ -872,9 +909,36 @@ export default function App() {
               >
                 <Send className="h-4 w-4" />
               </button>
+              {aiStreaming && (
+                <button
+                  type="button"
+                  onClick={stopAi}
+                  className="rounded-xl border border-slate-700 bg-slate-900 px-3 py-2.5 text-sm text-slate-300 hover:border-slate-600"
+                >
+                  Stop
+                </button>
+              )}
             </form>
           </div>
         )}
+
+        <div className="hidden">
+          {remoteStreams.map(({ id, stream }) => (
+            <audio
+              key={id}
+              autoPlay
+              playsInline
+              ref={(el) => {
+                if (!el) return
+                if (el.srcObject !== stream) {
+                  el.srcObject = stream
+                }
+                el.muted = !floorHolder || floorHolder.id !== id
+                el.play().catch(() => {})
+              }}
+            />
+          ))}
+        </div>
       </main>
 
       {/* ── settings modal ── */}
@@ -911,6 +975,14 @@ export default function App() {
         <div className="fixed bottom-0 inset-x-0 z-40 bg-amber-500/10 border-t border-amber-500/30 px-4 py-2 text-center text-xs text-amber-300">
           <WifiOff className="inline h-3.5 w-3.5 mr-1.5" />
           Connection lost — reconnecting…
+          <button
+            onClick={() => {
+              try { wsRef.current?.close() } catch {}
+            }}
+            className="ml-3 underline underline-offset-2"
+          >
+            Reconnect now
+          </button>
         </div>
       )}
     </div>

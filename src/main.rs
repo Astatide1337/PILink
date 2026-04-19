@@ -85,6 +85,12 @@ struct OllamaReq<'a> {
     prompt: &'a str,
     system: &'a str,
     stream: bool,
+    options: OllamaOptions,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaOptions {
+    num_predict: u32,
 }
 
 #[derive(Deserialize)]
@@ -386,6 +392,7 @@ async fn ai(State(app): State<AppState>, Json(req): Json<AiRequest>) -> impl Int
         prompt: &q,
         system: SYSTEM_PROMPT,
         stream: false,
+        options: OllamaOptions { num_predict: 220 },
     };
 
     let res = match app
@@ -453,6 +460,7 @@ async fn ai_stream(State(app): State<AppState>, Json(req): Json<AiStreamRequest>
         prompt: &q,
         system: SYSTEM_PROMPT,
         stream: true,
+        options: OllamaOptions { num_predict: 220 },
     };
 
     let res = match app
