@@ -665,8 +665,14 @@ async fn ws_session(socket: WebSocket, app: AppState) {
                     }
                 }
                 _ = ping_tick.tick() => {
+                    // WS-level Ping keeps TCP alive; browsers reply with Pong automatically.
+                    // Also send an app-level 'pong' message so the frontend can treat it as a
+                    // heartbeat even when background timer throttling pauses client pings.
                     if sink.send(WsMsg::Ping(Vec::new())).await.is_err() {
                         break; // client unreachable
+                    }
+                    if sink.send(WsMsg::Text(ev0("pong"))).await.is_err() {
+                        break;
                     }
                 }
             }

@@ -305,9 +305,13 @@ export default function App() {
         let data
         try { data = JSON.parse(e.data) } catch { return }
 
+        // Treat any valid message as connection liveness.
+        // Mobile browsers can throttle timers; relying only on ping/pong can
+        // cause unnecessary reconnects even while traffic is flowing.
+        armPongTimeout()
+
         switch (data.type) {
           case 'pong':
-            armPongTimeout()
             break
           case 'self:id':
             peerIdRef.current = data.payload.id
@@ -479,6 +483,23 @@ export default function App() {
   useEffect(() => { aiEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [aiChat])
 
   // ── voice actions ──
+
+  // Ensure WebRTC connections exist for all current voice peers.
+  // This makes voice join/leave feel instant and self-healing after reconnects.
+  useEffect(() => {
+    if (!inVoiceRef.current) return
+    const me = peerIdRef.current
+    if (!me) return
+    for (const peer of voicePeers) {
+      const rid = peer?.id
+      if (!rid || rid === me) continue
+      if (pcsRef.current[rid]) continue
+      // Deterministic offerer: smaller UUID initiates.
+      if (String(me) < String(rid)) {
+        connectToPeer(rid).catch(() => {})
+      }
+    }
+  }, [voicePeers, inVoice, peerId])
 
   async function joinVoice() {
     try {
