@@ -181,7 +181,7 @@ if sudo test -d "$DNS_DIR2"; then
   log "Wrote $TARGET2"
 fi
 
-log "Note: NetworkManager restart will happen at the end"
+log "Note: NetworkManager restart will happen at the end (only if activating AP)"
 
 log "Step 4/6: Open required ports on AP interface (best-effort)"
 if command -v iptables >/dev/null 2>&1; then
@@ -279,8 +279,13 @@ sudo systemctl --no-pager --full status pilink | sed -n '1,16p' || true
 
 log "Step 6/6: Optionally activate hotspot"
 
-log "Restarting NetworkManager to apply DNS overrides"
-sudo systemctl restart NetworkManager
+if [[ "$ACTIVATE_AP" -eq 1 ]]; then
+  log "Restarting NetworkManager to apply DNS overrides"
+  sudo systemctl restart NetworkManager
+else
+  log "Skipping NetworkManager restart (no --activate-ap)."
+  log "If you later activate the AP, rerun with --activate-ap to apply DNS overrides."
+fi
 
 if [[ "$ACTIVATE_AP" -eq 1 ]]; then
   warn "Bringing up '$AP_CON' may drop your SSH session."

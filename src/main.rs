@@ -14,10 +14,12 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     env,
+    convert::Infallible,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, RwLock};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -53,6 +55,11 @@ struct AiRequest {
     question: String,
 }
 
+#[derive(Deserialize)]
+struct AiStreamRequest {
+    question: String,
+}
+
 #[derive(Serialize)]
 struct AiResponse {
     answer: String,
@@ -83,6 +90,14 @@ struct OllamaReq<'a> {
 #[derive(Deserialize)]
 struct OllamaRes {
     response: String,
+}
+
+#[derive(Deserialize)]
+struct OllamaStreamRes {
+    #[serde(default)]
+    response: String,
+    #[serde(default)]
+    done: bool,
 }
 
 #[derive(Deserialize)]
@@ -149,14 +164,35 @@ fn ev0(t: &str) -> String {
 }
 
 async fn broadcast(clients: &RwLock<HashMap<Uuid, WsClient>>, msg: &str) {
-    for c in clients.read().await.values() {
-        let _ = c.tx.send(msg.into());
+    // Remove dead clients so we don't leak senders.
+    let mut dead: Vec<Uuid> = Vec::new();
+    {
+        let map = clients.read().await;
+        for (id, c) in map.iter() {
+            if c.tx.send(msg.into()).is_err() {
+                dead.push(*id);
+            }
+        }
+    }
+    if !dead.is_empty() {
+        let mut map = clients.write().await;
+        for id in dead {
+            map.remove(&id);
+        }
     }
 }
 
 async fn unicast(clients: &RwLock<HashMap<Uuid, WsClient>>, id: Uuid, msg: &str) {
-    if let Some(c) = clients.read().await.get(&id) {
-        let _ = c.tx.send(msg.into());
+    let mut remove = false;
+    {
+        if let Some(c) = clients.read().await.get(&id) {
+            if c.tx.send(msg.into()).is_err() {
+                remove = true;
+            }
+        }
+    }
+    if remove {
+        clients.write().await.remove(&id);
     }
 }
 
@@ -230,6 +266,7 @@ async fn main() {
         .route("/api/messages/:id", delete(del_msg))
         .route("/api/ai", post(ai))
         .route("/api/ai/health", get(ai_health))
+        .route("/api/ai/stream", post(ai_stream))
         .route("/api/ws", get(ws_upgrade))
         .with_state(app)
         .fallback_service(spa);
@@ -399,6 +436,106 @@ async fn ai(State(app): State<AppState>, Json(req): Json<AiRequest>) -> impl Int
     }
 }
 
+async fn ai_stream(State(app): State<AppState>, Json(req): Json<AiStreamRequest>) -> impl IntoResponse {
+    let q = req.question.trim().to_string();
+    if q.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrBody {
+                error: "question required".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    let body = OllamaReq {
+        model: &app.ollama_model,
+        prompt: &q,
+        system: SYSTEM_PROMPT,
+        stream: true,
+    };
+
+    let res = match app
+        .http
+        .post(format!("{OLLAMA_URL}/api/generate"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrBody {
+                    error: format!("ollama unreachable: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    if !res.status().is_success() {
+        if res.status() == StatusCode::NOT_FOUND {
+            let msg = format!(
+                "model '{}' not installed on this node. Fix: ollama pull {}",
+                app.ollama_model, app.ollama_model
+            );
+            return (StatusCode::BAD_GATEWAY, Json(ErrBody { error: msg })).into_response();
+        }
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrBody {
+                error: format!("ollama status {}", res.status()),
+            }),
+        )
+            .into_response();
+    }
+
+    let (tx, rx) = mpsc::unbounded_channel::<Result<bytes::Bytes, Infallible>>();
+
+    tokio::spawn(async move {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let Ok(chunk) = chunk else { break };
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                let line = buf.drain(..=pos).collect::<Vec<u8>>();
+                let line = match std::str::from_utf8(&line) {
+                    Ok(s) => s.trim(),
+                    Err(_) => continue,
+                };
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(ev) = serde_json::from_str::<OllamaStreamRes>(line) else { continue };
+                if !ev.response.is_empty() {
+                    let out = json!({"token": ev.response});
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!("{}\n", out))));
+                }
+                if ev.done {
+                    let _ = tx.send(Ok(bytes::Bytes::from_static(b"{\"done\":true}\n")));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(Ok(bytes::Bytes::from_static(
+            b"{\"done\":true}\n",
+        )));
+    });
+
+    let body = axum::body::Body::from_stream(UnboundedReceiverStream::new(rx));
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-ndjson; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
 async fn ai_health(State(app): State<AppState>) -> Json<AiHealth> {
     let want = app.ollama_model.clone();
 
@@ -548,6 +685,9 @@ async fn handle_ws_event(app: &AppState, cid: Uuid, e: WsIn) {
     let p = &e.payload;
 
     match e.t.as_str() {
+        "ping" => {
+            unicast(&app.clients, cid, &ev0("pong")).await;
+        }
         // ── chat ───────────────────────────────────────────────────────────
         "message:send" => {
             let sender = p.get("sender").and_then(|v| v.as_str()).unwrap_or_default();

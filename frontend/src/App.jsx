@@ -49,6 +49,7 @@ export default function App() {
   // ── ws + connection ──
   const wsRef = useRef(null)
   const [connected, setConnected] = useState(false)
+  const pingRef = useRef(null)
 
   // ── chat ──
   const [messages, setMessages] = useState([])
@@ -85,6 +86,18 @@ export default function App() {
   function wsSend(data) {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(data))
+    }
+  }
+
+  function startPing() {
+    stopPing()
+    pingRef.current = setInterval(() => wsSend({ type: 'ping' }), 20000)
+  }
+
+  function stopPing() {
+    if (pingRef.current) {
+      clearInterval(pingRef.current)
+      pingRef.current = null
     }
   }
 
@@ -195,6 +208,7 @@ export default function App() {
       ws.onclose = () => {
         setConnected(false)
         wsRef.current = null
+        stopPing()
         if (inVoiceRef.current) cleanupVoiceLocal()
         if (alive) timer = setTimeout(connect, 3000)
       }
@@ -206,6 +220,8 @@ export default function App() {
         try { data = JSON.parse(e.data) } catch { return }
 
         switch (data.type) {
+          case 'pong':
+            break
           case 'self:id':
             peerIdRef.current = data.payload.id
             setPeerId(data.payload.id)
@@ -246,6 +262,14 @@ export default function App() {
               if (prev.some(p => p.id === data.payload.id)) return prev
               return [...prev, data.payload]
             })
+
+            // If we're already in voice, ensure we connect to the newcomer.
+            // Deterministic offerer to reduce glare: lexicographically smaller id initiates.
+            if (inVoiceRef.current && peerIdRef.current && data.payload?.id && data.payload.id !== peerIdRef.current) {
+              if (!pcsRef.current[data.payload.id] && String(peerIdRef.current) < String(data.payload.id)) {
+                connectToPeer(data.payload.id).catch(() => {})
+              }
+            }
             break
 
           case 'voice:leave':
@@ -274,10 +298,12 @@ export default function App() {
             break
         }
       }
+
+      ws.addEventListener('open', startPing)
     }
 
     connect()
-    return () => { alive = false; clearTimeout(timer); wsRef.current?.close() }
+    return () => { alive = false; clearTimeout(timer); stopPing(); wsRef.current?.close() }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [name])
 
@@ -395,15 +421,55 @@ export default function App() {
     const ac = new AbortController()
     const timer = setTimeout(() => ac.abort(), 60000)
     try {
-      const res = await fetch('/api/ai', {
+      // Stream tokens if available.
+      const res = await fetch('/api/ai/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: q }),
         signal: ac.signal,
       })
-      const data = await res.json()
-      if (data.error) throw new Error(data.error)
-      setAiChat(prev => [...prev, { role: 'ai', text: data.answer || '(no response)' }])
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => null)
+        const msg = data?.error ? String(data.error) : `HTTP ${res.status}`
+        throw new Error(msg)
+      }
+
+      const reader = res.body?.getReader()
+      if (!reader) throw new Error('Streaming unsupported')
+
+      // Create the AI message once, then append tokens as they arrive.
+      let aiText = ''
+      setAiChat(prev => [...prev, { role: 'ai', text: '' }])
+
+      const dec = new TextDecoder()
+      let buf = ''
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+
+        let idx
+        while ((idx = buf.indexOf('\n')) !== -1) {
+          const line = buf.slice(0, idx).trim()
+          buf = buf.slice(idx + 1)
+          if (!line) continue
+          let obj
+          try { obj = JSON.parse(line) } catch { continue }
+          if (obj.token) {
+            aiText += String(obj.token)
+            setAiChat(prev => {
+              const next = prev.slice()
+              const last = next[next.length - 1]
+              if (last?.role === 'ai') next[next.length - 1] = { ...last, text: aiText }
+              return next
+            })
+          }
+          if (obj.done) {
+            return
+          }
+        }
+      }
     } catch (err) {
       setAiChat(prev => [...prev, { role: 'ai', text: `Error: ${err.message}` }])
     } finally {
@@ -795,7 +861,7 @@ export default function App() {
               <input
                 value={aiDraft}
                 onChange={e => setAiDraft(e.target.value)}
-                placeholder="Ask a survival question…"
+                placeholder="Ask PI anything…"
                 maxLength={320}
                 className="flex-1 rounded-xl border border-slate-700 bg-slate-900 px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 outline-none focus:border-emerald-600 focus:ring-1 focus:ring-emerald-600/40"
               />
