@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Keep scrollbars visible in dark UI (best-effort). */
+:root {
+  color-scheme: dark;
+}
