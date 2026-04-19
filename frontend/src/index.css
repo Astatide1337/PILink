@@ -2,7 +2,24 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Keep scrollbars visible in dark UI (best-effort). */
 :root {
   color-scheme: dark;
+}
+
+body {
+  background: #020617;
+  overflow-x: hidden;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Thin scrollbar for chat panels */
+.scroll-thin::-webkit-scrollbar {
+  width: 5px;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 3px;
 }

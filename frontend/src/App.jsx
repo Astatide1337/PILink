@@ -1,534 +1,820 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  AlertTriangle,
+  Bot,
   MessageCircle,
+  Mic,
+  MicOff,
+  MoreVertical,
+  Phone,
+  PhoneOff,
   Radio,
-  RefreshCw,
   Send,
-  Shield,
+  Trash2,
+  User,
+  X,
+  Wifi,
+  WifiOff,
 } from 'lucide-react'
 
-const STATUS = /** @type {const} */ ({
-  Safe: 'Safe',
-  Help: 'Help',
-  Resource: 'Resource',
-})
-
-function formatTime(tsSeconds) {
-  if (!tsSeconds) return ''
-  const d = new Date(tsSeconds * 1000)
-  return d.toLocaleString(undefined, {
-    month: 'short',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-}
-
-function relativeTime(tsSeconds) {
-  if (!tsSeconds) return ''
-  const ms = Date.now() - tsSeconds * 1000
-  if (!Number.isFinite(ms) || ms < 0) return formatTime(tsSeconds)
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s ago`
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m}m ago`
-  const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h ago`
-  const d = Math.floor(h / 24)
-  return `${d}d ago`
-}
-
-function statusMeta(status) {
-  switch (status) {
-    case STATUS.Safe:
-      return {
-        label: 'SAFE',
-        icon: Shield,
-        badge: 'border-emerald-900/60 bg-emerald-950/40 text-emerald-300',
-        accent: 'text-emerald-300',
-      }
-    case STATUS.Help:
-      return {
-        label: 'HELP',
-        icon: AlertTriangle,
-        badge: 'border-amber-900/60 bg-amber-950/30 text-amber-300',
-        accent: 'text-amber-300',
-      }
-    case STATUS.Resource:
-      return {
-        label: 'RESOURCE',
-        icon: Radio,
-        badge: 'border-cyan-900/60 bg-cyan-950/30 text-cyan-300',
-        accent: 'text-cyan-300',
-      }
-    default:
-      return {
-        label: String(status || 'UNKNOWN').toUpperCase(),
-        icon: Radio,
-        badge: 'border-slate-800 bg-slate-950/30 text-slate-200',
-        accent: 'text-slate-200',
-      }
-  }
-}
+// ── utils ──────────────────────────────────────────────────────────────────────
 
 function cn(...xs) {
   return xs.filter(Boolean).join(' ')
 }
 
-function TabButton({ active, onClick, icon: Icon, label }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        'inline-flex flex-1 items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm',
-        'border transition',
-        active
-          ? 'border-emerald-900/60 bg-emerald-950/30 text-emerald-200'
-          : 'border-slate-800 bg-slate-950/30 text-slate-200 hover:border-slate-700',
-      )}
-    >
-      <Icon className={cn('h-4 w-4', active ? 'text-emerald-300' : 'text-slate-300')} />
-      <span className="font-medium">{label}</span>
-    </button>
-  )
+function relTime(ts) {
+  if (!ts) return ''
+  const s = Math.floor((Date.now() / 1000) - ts)
+  if (s < 0) return 'now'
+  if (s < 60) return `${s}s ago`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ago`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ago`
+  return `${Math.floor(h / 24)}d ago`
 }
 
+// ── app ────────────────────────────────────────────────────────────────────────
+
 export default function App() {
-  const [alias, setAlias] = useState(() => localStorage.getItem('pilink.alias') || '')
-  const [status, setStatus] = useState(STATUS.Safe)
-  const [content, setContent] = useState('')
-  const [submitting, setSubmitting] = useState(false)
-  const [tab, setTab] = useState('board')
+  // ── name ──
+  const [name, setName] = useState(() => localStorage.getItem('pilink.name') || '')
+  const [nameInput, setNameInput] = useState('')
+  const [showSettings, setShowSettings] = useState(false)
+  const [showMenu, setShowMenu] = useState(false)
 
-  const [chatQ, setChatQ] = useState('')
-  const [chatBusy, setChatBusy] = useState(false)
-  const [chatErr, setChatErr] = useState('')
-  const [chat, setChat] = useState(() => {
-    try {
-      const raw = localStorage.getItem('pilink.chat.cache')
-      return raw ? JSON.parse(raw) : []
-    } catch {
-      return []
+  // ── tabs ──
+  const [tab, setTab] = useState('chat')
+
+  // ── ws + connection ──
+  const wsRef = useRef(null)
+  const [connected, setConnected] = useState(false)
+
+  // ── chat ──
+  const [messages, setMessages] = useState([])
+  const [draft, setDraft] = useState('')
+  const chatEndRef = useRef(null)
+
+  // ── identity ──
+  const [peerId, setPeerId] = useState(null)
+  const peerIdRef = useRef(null)
+
+  // ── voice ──
+  const [inVoice, setInVoice] = useState(false)
+  const inVoiceRef = useRef(false)
+  const [voicePeers, setVoicePeers] = useState([])
+  const [floorHolder, setFloorHolder] = useState(null)
+  const floorHolderRef = useRef(null)
+  const [floorDenied, setFloorDenied] = useState(false)
+  const pttDownRef = useRef(false)
+  const heartbeatRef = useRef(null)
+  const localStreamRef = useRef(null)
+  const pcsRef = useRef({})       // peerId → RTCPeerConnection
+  const audiosRef = useRef({})    // peerId → HTMLAudioElement
+
+  // ── ai ──
+  const [aiAvailable, setAiAvailable] = useState(null)
+  const [aiChat, setAiChat] = useState([])
+  const [aiDraft, setAiDraft] = useState('')
+  const [aiBusy, setAiBusy] = useState(false)
+  const aiEndRef = useRef(null)
+
+  // ── helpers ──
+  function wsSend(data) {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(data))
     }
-  })
+  }
 
-  const [posts, setPosts] = useState(() => {
-    try {
-      const raw = localStorage.getItem('pilink.posts.cache')
-      return raw ? JSON.parse(raw) : []
-    } catch {
-      return []
+  function startHeartbeat() {
+    stopHeartbeat()
+    heartbeatRef.current = setInterval(() => wsSend({ type: 'floor:heartbeat' }), 2000)
+  }
+
+  function stopHeartbeat() {
+    if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null }
+  }
+
+  // ── WebRTC helpers (use refs only, safe in any closure) ──
+
+  function createPC(remotePeerId) {
+    if (pcsRef.current[remotePeerId]) pcsRef.current[remotePeerId].close()
+
+    // No STUN/TURN — all peers are on the same LAN.
+    const pc = new RTCPeerConnection({ iceServers: [] })
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(t => pc.addTrack(t, localStreamRef.current))
     }
-  })
-  const [loading, setLoading] = useState(posts.length === 0)
-  const [error, setError] = useState('')
-  const [lastSync, setLastSync] = useState(0)
 
-  const listRef = useRef(null)
-  const chatRef = useRef(null)
-
-  useEffect(() => {
-    localStorage.setItem('pilink.alias', alias)
-  }, [alias])
-
-  useEffect(() => {
-    try {
-      localStorage.setItem('pilink.chat.cache', JSON.stringify(chat.slice(-24)))
-    } catch {
-      // ignore cache write failures
+    pc.ontrack = (e) => {
+      const audio = new Audio()
+      audio.srcObject = e.streams[0]
+      const holder = floorHolderRef.current
+      audio.muted = !holder || holder.id !== remotePeerId
+      audio.play().catch(() => {})
+      audiosRef.current[remotePeerId] = audio
     }
-    if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight
-  }, [chat])
 
-  async function refreshPosts({ silent } = { silent: false }) {
-    let aborted = false
-    const ac = new AbortController()
-    const t = setTimeout(() => {
-      aborted = true
-      ac.abort()
-    }, 4500)
-
-    try {
-      if (!silent) setLoading(true)
-      setError('')
-
-      const res = await fetch('/api/posts', {
-        method: 'GET',
-        headers: { Accept: 'application/json' },
-        signal: ac.signal,
-      })
-      if (!res.ok) throw new Error(`GET /api/posts -> ${res.status}`)
-      const data = await res.json()
-      if (!Array.isArray(data)) throw new Error('Invalid posts payload')
-
-      setPosts(data)
-      setLastSync(Date.now())
-      try {
-        localStorage.setItem('pilink.posts.cache', JSON.stringify(data))
-      } catch {
-        // ignore cache write failures
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        wsSend({ type: 'webrtc:ice', payload: { to: remotePeerId, candidate: e.candidate.toJSON() } })
       }
-    } catch (e) {
-      if (aborted) setError('Network timeout (node busy or out of range)')
-      else setError(e?.message || 'Failed to load feed')
-    } finally {
-      clearTimeout(t)
-      if (!silent) setLoading(false)
+    }
+
+    pcsRef.current[remotePeerId] = pc
+    return pc
+  }
+
+  async function connectToPeer(remotePeerId) {
+    const pc = createPC(remotePeerId)
+    const offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+    wsSend({ type: 'webrtc:offer', payload: { to: remotePeerId, sdp: offer.sdp } })
+  }
+
+  async function handleOffer({ from, sdp }) {
+    const pc = createPC(from)
+    await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }))
+    const answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    wsSend({ type: 'webrtc:answer', payload: { to: from, sdp: answer.sdp } })
+  }
+
+  async function handleAnswer({ from, sdp }) {
+    const pc = pcsRef.current[from]
+    if (pc) await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }))
+  }
+
+  async function handleIce({ from, candidate }) {
+    const pc = pcsRef.current[from]
+    if (pc && candidate) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(candidate)) } catch {}
     }
   }
+
+  function closePeer(id) {
+    pcsRef.current[id]?.close()
+    delete pcsRef.current[id]
+    const a = audiosRef.current[id]
+    if (a) { a.pause(); a.srcObject = null; delete audiosRef.current[id] }
+  }
+
+  function cleanupVoiceLocal() {
+    Object.keys(pcsRef.current).forEach(closePeer)
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(t => t.stop())
+      localStreamRef.current = null
+    }
+    stopHeartbeat()
+    pttDownRef.current = false
+    inVoiceRef.current = false
+    setInVoice(false)
+    setVoicePeers([])
+    setFloorHolder(null)
+    floorHolderRef.current = null
+  }
+
+  // ── WebSocket connection ──
 
   useEffect(() => {
-    refreshPosts({ silent: false })
+    if (!name) return
 
-    // Light polling for "live" feel without hammering a Pi.
-    const id = setInterval(() => {
-      if (document.visibilityState === 'visible') refreshPosts({ silent: true })
-    }, 5000)
-    return () => clearInterval(id)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+    let alive = true
+    let timer = null
 
-  async function submit(e) {
-    e.preventDefault()
-    if (!alias.trim() || !content.trim()) return
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const ws = new WebSocket(`${proto}//${location.host}/api/ws`)
+      wsRef.current = ws
 
-    setSubmitting(true)
-    setError('')
+      ws.onopen = () => setConnected(true)
+
+      ws.onclose = () => {
+        setConnected(false)
+        wsRef.current = null
+        if (inVoiceRef.current) cleanupVoiceLocal()
+        if (alive) timer = setTimeout(connect, 3000)
+      }
+
+      ws.onerror = () => {} // onclose fires after
+
+      ws.onmessage = (e) => {
+        let data
+        try { data = JSON.parse(e.data) } catch { return }
+
+        switch (data.type) {
+          case 'self:id':
+            peerIdRef.current = data.payload.id
+            setPeerId(data.payload.id)
+            break
+
+          case 'history':
+            setMessages(data.payload || [])
+            break
+
+          case 'message:new':
+            setMessages(prev => [...prev, data.payload])
+            break
+
+          case 'message:delete':
+            setMessages(prev => prev.filter(m => m.id !== data.payload.id))
+            break
+
+          case 'chat:clear':
+            setMessages([])
+            break
+
+          case 'voice:peers':
+            setVoicePeers(data.payload || [])
+            break
+
+          // Server sends this ONLY to the joining client with the pre-existing
+          // peer list. The joiner creates WebRTC offers to each existing peer.
+          case 'voice:joined':
+            if (inVoiceRef.current && Array.isArray(data.payload)) {
+              for (const peer of data.payload) {
+                connectToPeer(peer.id).catch(() => {})
+              }
+            }
+            break
+
+          case 'voice:join':
+            setVoicePeers(prev => {
+              if (prev.some(p => p.id === data.payload.id)) return prev
+              return [...prev, data.payload]
+            })
+            break
+
+          case 'voice:leave':
+            setVoicePeers(prev => prev.filter(p => p.id !== data.payload.id))
+            closePeer(data.payload.id)
+            break
+
+          case 'floor:state':
+            floorHolderRef.current = data.payload.holder
+            setFloorHolder(data.payload.holder)
+            break
+
+          case 'floor:denied':
+            setFloorDenied(true)
+            setTimeout(() => setFloorDenied(false), 1200)
+            break
+
+          case 'webrtc:offer':
+            handleOffer(data.payload).catch(() => {})
+            break
+          case 'webrtc:answer':
+            handleAnswer(data.payload).catch(() => {})
+            break
+          case 'webrtc:ice':
+            handleIce(data.payload).catch(() => {})
+            break
+        }
+      }
+    }
+
+    connect()
+    return () => { alive = false; clearTimeout(timer); wsRef.current?.close() }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [name])
+
+  // ── Mute/unmute remote audio based on floor holder ──
+
+  useEffect(() => {
+    Object.entries(audiosRef.current).forEach(([id, audio]) => {
+      audio.muted = !floorHolder || floorHolder.id !== id
+    })
+  }, [floorHolder])
+
+  // When floor is granted to us and we're still pressing PTT, enable mic.
+  useEffect(() => {
+    if (!floorHolder || !peerIdRef.current) return
+    if (floorHolder.id === peerIdRef.current) {
+      if (pttDownRef.current) {
+        localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = true })
+        startHeartbeat()
+      } else {
+        // Released before grant arrived — release immediately
+        wsSend({ type: 'floor:release' })
+      }
+    } else {
+      localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = false })
+      stopHeartbeat()
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [floorHolder])
+
+  // Auto-scroll chat
+  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+  useEffect(() => { aiEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [aiChat])
+
+  // ── voice actions ──
+
+  async function joinVoice() {
     try {
-      const res = await fetch('/api/posts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({
-          alias: alias.trim().slice(0, 32),
-          status,
-          content: content.trim().slice(0, 600),
-        }),
-      })
-      if (!res.ok) throw new Error(`POST /api/posts -> ${res.status}`)
-      const created = await res.json()
-
-      // Prepend locally for snappy UX; next poll will reconcile.
-      setPosts((p) => [created, ...p])
-      setContent('')
-
-      // Nudge scroll to top so the new broadcast is visible.
-      if (listRef.current) listRef.current.scrollTop = 0
-    } catch (e) {
-      setError(e?.message || 'Failed to broadcast')
-    } finally {
-      setSubmitting(false)
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      stream.getAudioTracks().forEach(t => { t.enabled = false })
+      localStreamRef.current = stream
+      inVoiceRef.current = true
+      setInVoice(true)
+      wsSend({ type: 'voice:join', payload: { name } })
+    } catch {
+      alert('Microphone access required for voice channel.')
     }
   }
+
+  function leaveVoice() {
+    if (floorHolderRef.current?.id === peerIdRef.current) {
+      wsSend({ type: 'floor:release' })
+    }
+    wsSend({ type: 'voice:leave' })
+    cleanupVoiceLocal()
+  }
+
+  function onPttDown(e) {
+    e.preventDefault()
+    if (!inVoiceRef.current) return
+    pttDownRef.current = true
+    wsSend({ type: 'floor:request' })
+  }
+
+  function onPttUp(e) {
+    e.preventDefault()
+    pttDownRef.current = false
+    if (floorHolderRef.current?.id === peerIdRef.current) {
+      localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = false })
+      stopHeartbeat()
+      wsSend({ type: 'floor:release' })
+    }
+  }
+
+  // ── chat actions ──
+
+  function sendMessage(e) {
+    e.preventDefault()
+    const text = draft.trim()
+    if (!text) return
+    wsSend({ type: 'message:send', payload: { sender: name, content: text } })
+    setDraft('')
+  }
+
+  function deleteMessage(id) {
+    wsSend({ type: 'message:delete', payload: { id } })
+  }
+
+  function clearChat() {
+    wsSend({ type: 'chat:clear' })
+    setShowMenu(false)
+  }
+
+  // ── AI ──
+
+  useEffect(() => {
+    if (tab !== 'ai') return
+    let cancelled = false
+    fetch('/api/ai/health').then(r => r.json()).then(d => {
+      if (!cancelled) setAiAvailable(d.available)
+    }).catch(() => { if (!cancelled) setAiAvailable(false) })
+    return () => { cancelled = true }
+  }, [tab])
 
   async function askAi(e) {
     e.preventDefault()
-    const q = chatQ.trim()
-    if (!q || chatBusy) return
-
-    setChatBusy(true)
-    setChatErr('')
-    setChatQ('')
-    setChat((c) => [...c, { role: 'user', text: q, t: Date.now() }])
-
-    let aborted = false
-    const ac = new AbortController()
-    const t = setTimeout(() => {
-      aborted = true
-      ac.abort()
-    }, 15000)
+    const q = aiDraft.trim()
+    if (!q || aiBusy) return
+    setAiBusy(true)
+    setAiDraft('')
+    setAiChat(prev => [...prev, { role: 'user', text: q }])
 
     try {
       const res = await fetch('/api/ai', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: q }),
-        signal: ac.signal,
+        signal: AbortSignal.timeout(60000),
       })
-      if (!res.ok) {
-        const maybe = await res.json().catch(() => null)
-        const msg = maybe?.error ? String(maybe.error) : `POST /api/ai -> ${res.status}`
-        throw new Error(msg)
-      }
       const data = await res.json()
-      const a = String(data?.answer || '').trim()
-      setChat((c) => [...c, { role: 'ai', text: a || '(no response)', t: Date.now() }])
-    } catch (e) {
-      setChatErr(aborted ? 'AI timeout (node busy or model cold-starting)' : e?.message || 'AI request failed')
-      setChat((c) => [...c, { role: 'ai', text: 'AI link degraded. Try again or ask a shorter question.', t: Date.now() }])
+      if (data.error) throw new Error(data.error)
+      setAiChat(prev => [...prev, { role: 'ai', text: data.answer || '(no response)' }])
+    } catch (err) {
+      setAiChat(prev => [...prev, { role: 'ai', text: `Error: ${err.message}` }])
     } finally {
-      clearTimeout(t)
-      setChatBusy(false)
+      setAiBusy(false)
     }
   }
 
-  return (
-    <div className="min-h-screen bg-slate-950 text-emerald-400">
-      {/* Background: subtle grid + radial glow */}
-      <div className="pointer-events-none fixed inset-0 opacity-60">
-        <div className="absolute inset-0 bg-[radial-gradient(900px_circle_at_20%_10%,rgba(16,185,129,0.14),transparent_60%)]" />
-        <div className="absolute inset-0 bg-[linear-gradient(to_right,rgba(30,41,59,0.38)_1px,transparent_1px),linear-gradient(to_bottom,rgba(30,41,59,0.38)_1px,transparent_1px)] bg-[size:48px_48px]" />
-        <div className="absolute inset-0 bg-gradient-to-b from-slate-950/30 via-slate-950/60 to-slate-950" />
-      </div>
+  // ── name save helper ──
+  function saveName(n) {
+    const trimmed = n.trim().slice(0, 32)
+    if (!trimmed) return
+    localStorage.setItem('pilink.name', trimmed)
+    setName(trimmed)
+    setShowSettings(false)
+  }
 
-      <div className="relative mx-auto max-w-6xl px-4 py-6 sm:px-6">
-        <header className="flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="grid h-10 w-10 place-items-center rounded-xl border border-slate-800 bg-slate-950/40">
-              <Radio className="h-5 w-5 text-emerald-300" />
+  // ══════════════════════════════════════════════════════════════════════════
+  // RENDER
+  // ══════════════════════════════════════════════════════════════════════════
+
+  // ── first-run: name required ──
+
+  if (!name) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-950 px-4">
+        <div className="w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-900/80 p-6">
+          <div className="flex items-center gap-3 mb-5">
+            <div className="grid h-10 w-10 place-items-center rounded-xl border border-slate-700 bg-slate-800">
+              <Radio className="h-5 w-5 text-emerald-400" />
             </div>
             <div>
-              <div className="text-sm font-semibold tracking-tight text-slate-100">PILink Emergency Hub</div>
-              <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-400">
-                <span className="relative flex h-2.5 w-2.5">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/50" />
-                  <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-400" />
-                </span>
-                <span>System live</span>
-                <span className="text-slate-600">•</span>
-                <span className="text-slate-500">Last sync</span>
-                <span className="text-emerald-300">{lastSync ? new Date(lastSync).toLocaleTimeString() : '—'}</span>
-              </div>
+              <div className="text-base font-semibold text-slate-100">PILink</div>
+              <div className="text-xs text-slate-400">Offline mesh communicator</div>
             </div>
           </div>
-        </header>
+          <label className="block mb-1 text-xs text-slate-400">Display name</label>
+          <input
+            autoFocus
+            value={nameInput}
+            onChange={e => setNameInput(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && saveName(nameInput)}
+            placeholder="Your name or callsign"
+            maxLength={32}
+            className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 outline-none focus:border-emerald-600 focus:ring-1 focus:ring-emerald-600/40"
+          />
+          <button
+            onClick={() => saveName(nameInput)}
+            disabled={!nameInput.trim()}
+            className="mt-4 w-full rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed transition"
+          >
+            Continue
+          </button>
+          <p className="mt-4 text-[11px] text-slate-500 text-center leading-relaxed">
+            If pilink.astatide.com doesn't load, try{' '}
+            <span className="text-slate-400">https://10.42.0.1</span>
+          </p>
+        </div>
+      </div>
+    )
+  }
 
-        <div className="mt-4 flex gap-2 lg:hidden">
-          <TabButton active={tab === 'board'} onClick={() => setTab('board')} icon={Radio} label="Board" />
-          <TabButton active={tab === 'broadcast'} onClick={() => setTab('broadcast')} icon={Send} label="Broadcast" />
-          <TabButton active={tab === 'ai'} onClick={() => setTab('ai')} icon={MessageCircle} label="AI" />
+  // ── main app ──
+
+  const iAmSpeaking = floorHolder?.id === peerId
+  const someoneElseSpeaking = floorHolder && floorHolder.id !== peerId
+
+  return (
+    <div className="flex min-h-screen flex-col bg-slate-950 text-slate-100">
+      {/* ── header ── */}
+      <header className="sticky top-0 z-30 border-b border-slate-800 bg-slate-950/90 backdrop-blur">
+        <div className="mx-auto flex max-w-2xl items-center justify-between px-4 py-3">
+          <div className="flex items-center gap-2.5">
+            <Radio className="h-5 w-5 text-emerald-400" />
+            <span className="text-sm font-semibold tracking-tight">PILink</span>
+            {connected
+              ? <span className="ml-1.5 h-2 w-2 rounded-full bg-emerald-400" title="Connected" />
+              : <span className="ml-1.5 h-2 w-2 rounded-full bg-red-400 animate-pulse" title="Disconnected" />}
+          </div>
+
+          <div className="flex items-center gap-2">
+            {/* user badge — tap to edit name */}
+            <button
+              onClick={() => { setNameInput(name); setShowSettings(true) }}
+              className="flex items-center gap-1.5 rounded-lg border border-slate-800 bg-slate-900/60 px-2.5 py-1.5 text-xs text-slate-300 hover:border-slate-700 transition"
+            >
+              <User className="h-3.5 w-3.5" />
+              <span className="max-w-[100px] truncate">{name}</span>
+            </button>
+
+            {/* menu */}
+            <div className="relative">
+              <button
+                onClick={() => setShowMenu(!showMenu)}
+                className="rounded-lg border border-slate-800 bg-slate-900/60 p-1.5 text-slate-400 hover:text-slate-200 hover:border-slate-700 transition"
+              >
+                <MoreVertical className="h-4 w-4" />
+              </button>
+              {showMenu && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setShowMenu(false)} />
+                  <div className="absolute right-0 z-50 mt-1 w-44 rounded-xl border border-slate-800 bg-slate-900 shadow-xl">
+                    <button
+                      onClick={clearChat}
+                      className="flex w-full items-center gap-2 px-3 py-2.5 text-xs text-red-400 hover:bg-slate-800 rounded-xl transition"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" /> Clear all messages
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
         </div>
 
-        <main className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-12">
-          <section className={cn('lg:col-span-5', tab !== 'ai' ? 'hidden lg:block' : '')}>
-            <div className="rounded-2xl border border-slate-800 bg-slate-950/40 backdrop-blur">
-              <div className="flex items-center justify-between gap-3 border-b border-slate-800 px-4 py-3">
-                <div className="flex items-center gap-2">
-                  <MessageCircle className="h-4 w-4 text-emerald-300" />
-                  <div className="text-sm font-semibold text-slate-100">PILink AI</div>
-                </div>
-                <div className="text-xs text-slate-400">Survival expert mode</div>
-              </div>
+        {/* ── tabs ── */}
+        <div className="mx-auto flex max-w-2xl px-4 pb-2 gap-1">
+          <button
+            onClick={() => setTab('chat')}
+            className={cn(
+              'flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-xs font-medium transition',
+              tab === 'chat'
+                ? 'bg-emerald-600/15 text-emerald-400 border border-emerald-600/30'
+                : 'text-slate-400 hover:text-slate-200 border border-transparent'
+            )}
+          >
+            <MessageCircle className="h-3.5 w-3.5" /> Chat
+          </button>
+          <button
+            onClick={() => setTab('ai')}
+            className={cn(
+              'flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-xs font-medium transition',
+              tab === 'ai'
+                ? 'bg-emerald-600/15 text-emerald-400 border border-emerald-600/30'
+                : 'text-slate-400 hover:text-slate-200 border border-transparent'
+            )}
+          >
+            <Bot className="h-3.5 w-3.5" /> AI
+          </button>
+        </div>
+      </header>
 
-              <div className="px-4 py-4">
-                <div
-                  ref={chatRef}
-                  className="max-h-[36vh] overflow-auto rounded-2xl border border-slate-800 bg-slate-950/30 p-3"
-                >
-                  {chat.length === 0 ? (
-                    <div className="text-xs text-slate-500">
-                      Ask about water purification, first aid, shelter, navigation, signaling, or triage.
-                    </div>
-                  ) : (
-                    <div className="grid gap-2">
-                      {chat.slice(-24).map((m, idx) => (
-                        <div
-                          key={`${m.t || 0}-${idx}`}
-                          className={cn(
-                            'rounded-xl border px-3 py-2 text-sm leading-relaxed',
-                            m.role === 'user'
-                              ? 'ml-6 border-slate-800 bg-slate-950/35 text-slate-100'
-                              : 'mr-6 border-emerald-900/50 bg-emerald-950/25 text-emerald-100',
-                          )}
-                        >
-                          <div className="mb-1 font-mono text-[11px] uppercase tracking-[0.18em] text-slate-500">
-                            {m.role === 'user' ? 'You' : 'Survival Expert'}
-                          </div>
-                          <div className="whitespace-pre-wrap break-words">{m.text}</div>
-                        </div>
-                      ))}
-                    </div>
+      {/* ── content ── */}
+      <main className="flex-1 mx-auto w-full max-w-2xl flex flex-col">
+
+        {/* ──────────── CHAT TAB ──────────── */}
+        {tab === 'chat' && (
+          <div className="flex flex-1 flex-col">
+            {/* voice channel panel */}
+            <div className="border-b border-slate-800 px-4 py-3">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2 text-xs text-slate-400">
+                  <Mic className="h-3.5 w-3.5" />
+                  <span>Voice Channel</span>
+                  {voicePeers.length > 0 && (
+                    <span className="text-emerald-400 font-medium">{voicePeers.length} in channel</span>
                   )}
                 </div>
-
-                {chatErr ? (
-                  <div className="mt-3 rounded-xl border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-sm text-amber-200">
-                    {chatErr}
-                  </div>
-                ) : null}
-
-                <form onSubmit={askAi} className="mt-3 flex items-center gap-2">
-                  <input
-                    value={chatQ}
-                    onChange={(e) => setChatQ(e.target.value)}
-                    placeholder="Ask a survival question…"
-                    className="w-full rounded-xl border border-slate-800 bg-slate-950/50 px-3 py-2 text-slate-100 placeholder:text-slate-600 outline-none focus:border-emerald-700 focus:ring-2 focus:ring-emerald-700/30"
-                    maxLength={320}
-                  />
+                {!inVoice ? (
                   <button
-                    type="submit"
-                    disabled={chatBusy || !chatQ.trim()}
-                    className={cn(
-                      'inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-mono uppercase tracking-[0.22em] transition',
-                      'border border-emerald-900/60 bg-emerald-950/40 text-emerald-200',
-                      'hover:border-emerald-800 hover:bg-emerald-950/55',
-                      'disabled:cursor-not-allowed disabled:opacity-50',
-                    )}
-                    aria-label="Send question"
-                    title="Send"
+                    onClick={joinVoice}
+                    disabled={!connected}
+                    className="flex items-center gap-1.5 rounded-lg bg-emerald-600/15 border border-emerald-600/30 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:bg-emerald-600/25 disabled:opacity-40 transition"
                   >
-                    <Send className="h-4 w-4" />
-                    <span className="hidden sm:inline">Ask</span>
+                    <Phone className="h-3.5 w-3.5" /> Join
                   </button>
-                </form>
+                ) : (
+                  <button
+                    onClick={leaveVoice}
+                    className="flex items-center gap-1.5 rounded-lg bg-red-500/10 border border-red-500/30 px-3 py-1.5 text-xs font-medium text-red-400 hover:bg-red-500/20 transition"
+                  >
+                    <PhoneOff className="h-3.5 w-3.5" /> Leave
+                  </button>
+                )}
               </div>
-            </div>
 
-            <div className={cn('mt-4 rounded-2xl border border-slate-800 bg-slate-950/40 backdrop-blur', tab !== 'broadcast' ? 'hidden lg:block' : '')}>
-              <div className="flex items-center justify-between gap-3 border-b border-slate-800 px-4 py-3">
-                <div className="text-sm font-semibold text-slate-100">Broadcast</div>
-                <div className="text-xs text-slate-400">Share status + location</div>
-              </div>
-
-              <form onSubmit={submit} className="px-4 py-4">
-                <div className="grid grid-cols-1 gap-3">
-                  <label className="block">
-                    <div className="mb-1 text-xs text-slate-400">Alias</div>
-                    <input
-                      value={alias}
-                      onChange={(e) => setAlias(e.target.value)}
-                      placeholder="Name or callsign"
-                      className="w-full rounded-xl border border-slate-800 bg-slate-950/50 px-3 py-2 text-slate-100 placeholder:text-slate-600 outline-none ring-0 focus:border-emerald-700 focus:ring-2 focus:ring-emerald-700/30"
-                      autoComplete="nickname"
-                      maxLength={32}
-                    />
-                  </label>
-
-                  <label className="block">
-                    <div className="mb-1 text-xs text-slate-400">Status</div>
-                    <select
-                      value={status}
-                      onChange={(e) => setStatus(e.target.value)}
-                      className="w-full rounded-xl border border-slate-800 bg-slate-950/50 px-3 py-2 text-slate-100 outline-none focus:border-emerald-700 focus:ring-2 focus:ring-emerald-700/30"
+              {/* participant names */}
+              {voicePeers.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {voicePeers.map(p => (
+                    <span
+                      key={p.id}
+                      className={cn(
+                        'inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px]',
+                        floorHolder?.id === p.id
+                          ? 'bg-red-500/15 text-red-300 border border-red-500/30'
+                          : 'bg-slate-800 text-slate-400 border border-slate-700'
+                      )}
                     >
-                      <option value={STATUS.Safe}>Safe</option>
-                      <option value={STATUS.Help}>Help</option>
-                      <option value={STATUS.Resource}>Resource</option>
-                    </select>
-                  </label>
-
-                  <label className="block">
-                    <div className="mb-1 text-xs text-slate-400">Message</div>
-                    <textarea
-                      value={content}
-                      onChange={(e) => setContent(e.target.value)}
-                      placeholder="Location, needs, resources, updates..."
-                      rows={5}
-                      className="w-full resize-none rounded-xl border border-slate-800 bg-slate-950/50 px-3 py-2 text-slate-100 placeholder:text-slate-600 outline-none ring-0 focus:border-emerald-700 focus:ring-2 focus:ring-emerald-700/30"
-                      maxLength={600}
-                    />
-                  </label>
-                </div>
-
-                {error ? (
-                  <div className="mt-3 rounded-xl border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-sm text-amber-200">
-                    {error}
-                  </div>
-                ) : null}
-
-                <div className="mt-4 flex items-center justify-between gap-3">
-                  <button
-                    type="button"
-                    onClick={() => refreshPosts({ silent: false })}
-                    className="rounded-xl border border-slate-800 bg-slate-950/40 px-3 py-2 text-xs font-mono uppercase tracking-[0.22em] text-slate-200 hover:border-slate-700"
-                  >
-                    <span className="inline-flex items-center gap-2">
-                      <RefreshCw className="h-4 w-4" />
-                      Refresh
+                      {floorHolder?.id === p.id && <span className="h-1.5 w-1.5 rounded-full bg-red-400 animate-pulse" />}
+                      {p.name}
+                      {p.id === peerId && <span className="text-slate-500">(you)</span>}
                     </span>
-                  </button>
+                  ))}
+                </div>
+              )}
+
+              {/* PTT button — only visible when in voice */}
+              {inVoice && (
+                <div className="flex flex-col items-center gap-1.5">
+                  {floorHolder && floorHolder.id !== peerId && (
+                    <div className="text-[11px] text-amber-400">
+                      {floorHolder.name} is speaking…
+                    </div>
+                  )}
 
                   <button
-                    type="submit"
-                    disabled={submitting || !alias.trim() || !content.trim()}
+                    onPointerDown={onPttDown}
+                    onPointerUp={onPttUp}
+                    onPointerCancel={onPttUp}
+                    onContextMenu={e => e.preventDefault()}
+                    disabled={someoneElseSpeaking}
                     className={cn(
-                      'rounded-xl px-4 py-2 text-xs font-mono uppercase tracking-[0.22em] transition',
-                      'border border-emerald-900/60 bg-emerald-950/40 text-emerald-200',
-                      'hover:border-emerald-800 hover:bg-emerald-950/55',
-                      'disabled:cursor-not-allowed disabled:opacity-50',
+                      'w-full max-w-xs rounded-xl py-3 text-sm font-medium select-none touch-none transition',
+                      iAmSpeaking
+                        ? 'bg-red-500/20 border-2 border-red-500 text-red-300 animate-pulse'
+                        : floorDenied
+                          ? 'bg-amber-500/10 border-2 border-amber-500/40 text-amber-400'
+                          : someoneElseSpeaking
+                            ? 'bg-slate-800 border-2 border-slate-700 text-slate-500 cursor-not-allowed'
+                            : 'bg-slate-800 border-2 border-slate-700 text-slate-300 hover:border-slate-600 active:bg-emerald-600/15 active:border-emerald-500 active:text-emerald-300'
                     )}
                   >
-                    {submitting ? 'Broadcasting…' : 'Broadcast'}
+                    {iAmSpeaking ? (
+                      <span className="flex items-center justify-center gap-2">
+                        <Mic className="h-4 w-4" /> Speaking…
+                      </span>
+                    ) : floorDenied ? (
+                      <span className="flex items-center justify-center gap-2">
+                        <MicOff className="h-4 w-4" /> Floor busy
+                      </span>
+                    ) : someoneElseSpeaking ? (
+                      <span className="flex items-center justify-center gap-2">
+                        <MicOff className="h-4 w-4" /> Floor busy
+                      </span>
+                    ) : (
+                      <span className="flex items-center justify-center gap-2">
+                        <Mic className="h-4 w-4" /> Hold to Talk
+                      </span>
+                    )}
                   </button>
                 </div>
-              </form>
+              )}
             </div>
-          </section>
 
-          <section className={cn('lg:col-span-7', tab !== 'board' ? 'hidden lg:block' : '')}>
-            <div className="rounded-2xl border border-slate-800 bg-slate-950/40 backdrop-blur">
-              <div className="flex items-center justify-between gap-3 border-b border-slate-800 px-4 py-3">
-                <div className="text-sm font-semibold text-slate-100">Community Board</div>
-                <button
-                  type="button"
-                  onClick={() => refreshPosts({ silent: false })}
-                  className="inline-flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/30 px-3 py-2 text-xs text-slate-200 hover:border-slate-700"
-                >
-                  <RefreshCw className="h-4 w-4" />
-                  Refresh
-                </button>
-              </div>
-
-              <div className="px-4 py-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="text-xs text-slate-400">
-                    {loading ? 'Syncing…' : `${posts.length} message${posts.length === 1 ? '' : 's'}`}
-                  </div>
-                  <div className="text-xs text-slate-500">Auto refresh: 5s</div>
+            {/* message list */}
+            <div className="flex-1 overflow-y-auto scroll-thin px-4 py-3 space-y-2" style={{ minHeight: 0 }}>
+              {messages.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full text-slate-500 text-sm">
+                  <MessageCircle className="h-8 w-8 mb-2 text-slate-600" />
+                  No messages yet
                 </div>
-              </div>
-
-              <div
-                ref={listRef}
-                className="max-h-[62vh] overflow-auto border-t border-slate-800"
-              >
-                {posts.length === 0 ? (
-                  <div className="px-4 py-8 text-center">
-                    <div className="mx-auto w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-950/40 p-5">
-                      <div className="text-sm font-mono text-slate-200">No broadcasts yet.</div>
-                      <div className="mt-2 text-xs text-slate-500">
-                        Use the Broadcast panel to post the first status update.
+              ) : (
+                messages.map(m => (
+                  <div key={m.id} className="group flex gap-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-xs font-medium text-emerald-400 truncate">{m.sender}</span>
+                        <span className="text-[10px] text-slate-500 shrink-0">{relTime(m.timestamp)}</span>
+                      </div>
+                      <div className="text-sm text-slate-200 break-words whitespace-pre-wrap mt-0.5">
+                        {m.content}
                       </div>
                     </div>
+                    <button
+                      onClick={() => deleteMessage(m.id)}
+                      className="opacity-0 group-hover:opacity-100 shrink-0 self-start mt-1 p-1 text-slate-500 hover:text-red-400 transition"
+                      title="Delete message"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
                   </div>
+                ))
+              )}
+              <div ref={chatEndRef} />
+            </div>
+
+            {/* message input */}
+            <form onSubmit={sendMessage} className="border-t border-slate-800 px-4 py-3 flex gap-2">
+              <input
+                value={draft}
+                onChange={e => setDraft(e.target.value)}
+                placeholder="Type a message…"
+                maxLength={600}
+                className="flex-1 rounded-xl border border-slate-700 bg-slate-900 px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 outline-none focus:border-emerald-600 focus:ring-1 focus:ring-emerald-600/40"
+              />
+              <button
+                type="submit"
+                disabled={!draft.trim() || !connected}
+                className="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                <Send className="h-4 w-4" />
+              </button>
+            </form>
+          </div>
+        )}
+
+        {/* ──────────── AI TAB ──────────── */}
+        {tab === 'ai' && (
+          <div className="flex flex-1 flex-col">
+            {/* status bar */}
+            <div className="border-b border-slate-800 px-4 py-3 flex items-center justify-between">
+              <div className="flex items-center gap-2 text-xs">
+                <Bot className="h-4 w-4 text-emerald-400" />
+                <span className="font-medium text-slate-200">Survival Expert</span>
+              </div>
+              <div className="flex items-center gap-1.5 text-[11px]">
+                {aiAvailable === null ? (
+                  <span className="text-slate-500">checking…</span>
+                ) : aiAvailable ? (
+                  <>
+                    <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                    <span className="text-emerald-400">Available</span>
+                  </>
                 ) : (
-                  <div className="grid gap-3 p-4">
-                    {posts.map((m) => {
-                      const meta = statusMeta(m.status)
-                      const Icon = meta.icon
-                      return (
-                        <article
-                          key={m.id || `${m.alias}-${m.timestamp}-${m.content}`}
-                          className="rounded-2xl border border-slate-800 bg-slate-950/35 p-4"
-                        >
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="min-w-0">
-                              <div className="flex items-center gap-2">
-                                <div className={cn('inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-[11px] font-mono tracking-[0.18em]', meta.badge)}>
-                                  <Icon className={cn('h-3.5 w-3.5', meta.accent)} />
-                                  <span>{meta.label}</span>
-                                </div>
-                                <div className="truncate text-sm font-medium text-slate-100">{m.alias || 'Anonymous'}</div>
-                              </div>
-                              <div className="mt-2 whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-100">
-                                {m.content}
-                              </div>
-                            </div>
-                            <div className="shrink-0 text-right">
-                              <div className="text-xs text-slate-500">{relativeTime(m.timestamp) || '—'}</div>
-                            </div>
-                          </div>
-                        </article>
-                      )
-                    })}
-                  </div>
+                  <>
+                    <span className="h-2 w-2 rounded-full bg-red-400" />
+                    <span className="text-red-400">Unavailable</span>
+                  </>
                 )}
               </div>
             </div>
-          </section>
-        </main>
-      </div>
+
+            {/* ai chat messages */}
+            <div className="flex-1 overflow-y-auto scroll-thin px-4 py-3 space-y-3" style={{ minHeight: 0 }}>
+              {aiChat.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full text-slate-500 text-sm text-center px-6">
+                  <Bot className="h-8 w-8 mb-2 text-slate-600" />
+                  <p>Ask about water purification, first aid, shelter, navigation, signaling, or triage.</p>
+                  {aiAvailable === false && (
+                    <p className="mt-2 text-amber-400 text-xs">AI model is not running. Responses will fail until Ollama is started.</p>
+                  )}
+                </div>
+              ) : (
+                aiChat.map((m, i) => (
+                  <div
+                    key={i}
+                    className={cn(
+                      'rounded-xl border px-3 py-2.5 text-sm leading-relaxed',
+                      m.role === 'user'
+                        ? 'ml-8 border-slate-700 bg-slate-800/60 text-slate-100'
+                        : 'mr-8 border-emerald-900/40 bg-emerald-950/20 text-emerald-100'
+                    )}
+                  >
+                    <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                      {m.role === 'user' ? 'You' : 'Survival Expert'}
+                    </div>
+                    <div className="whitespace-pre-wrap break-words">{m.text}</div>
+                  </div>
+                ))
+              )}
+              {aiBusy && (
+                <div className="mr-8 rounded-xl border border-emerald-900/40 bg-emerald-950/20 px-3 py-2.5 text-sm text-emerald-200">
+                  <div className="flex items-center gap-2">
+                    <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                    Thinking…
+                  </div>
+                </div>
+              )}
+              <div ref={aiEndRef} />
+            </div>
+
+            {/* ai input */}
+            <form onSubmit={askAi} className="border-t border-slate-800 px-4 py-3 flex gap-2">
+              <input
+                value={aiDraft}
+                onChange={e => setAiDraft(e.target.value)}
+                placeholder="Ask a survival question…"
+                maxLength={320}
+                className="flex-1 rounded-xl border border-slate-700 bg-slate-900 px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 outline-none focus:border-emerald-600 focus:ring-1 focus:ring-emerald-600/40"
+              />
+              <button
+                type="submit"
+                disabled={!aiDraft.trim() || aiBusy}
+                className="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                <Send className="h-4 w-4" />
+              </button>
+            </form>
+          </div>
+        )}
+      </main>
+
+      {/* ── settings modal ── */}
+      {showSettings && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4" onClick={() => setShowSettings(false)}>
+          <div className="w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-900 p-5" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <span className="text-sm font-medium text-slate-200">Change name</span>
+              <button onClick={() => setShowSettings(false)} className="text-slate-400 hover:text-slate-200">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <input
+              autoFocus
+              value={nameInput}
+              onChange={e => setNameInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && saveName(nameInput)}
+              maxLength={32}
+              className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-emerald-600 focus:ring-1 focus:ring-emerald-600/40"
+            />
+            <button
+              onClick={() => saveName(nameInput)}
+              disabled={!nameInput.trim()}
+              className="mt-3 w-full rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40 transition"
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── disconnected banner ── */}
+      {!connected && (
+        <div className="fixed bottom-0 inset-x-0 z-40 bg-amber-500/10 border-t border-amber-500/30 px-4 py-2 text-center text-xs text-amber-300">
+          <WifiOff className="inline h-3.5 w-3.5 mr-1.5" />
+          Connection lost — reconnecting…
+        </div>
+      )}
     </div>
   )
 }

@@ -10,8 +10,10 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      // Let `fetch('/api/...')` work in dev.
-      '/api': 'http://127.0.0.1:3000',
+      '/api': {
+        target: 'http://127.0.0.1:3000',
+        ws: true,
+      },
       '/health': 'http://127.0.0.1:3000',
     },
   },

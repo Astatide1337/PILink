@@ -1,202 +1,338 @@
 use axum::{
-    extract::State,
+    extract::{
+        ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
     http::StatusCode,
-    response::IntoResponse,
-    response::Redirect,
-    routing::get,
+    response::{IntoResponse, Redirect},
+    routing::{delete, get, post},
     Json, Router,
 };
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
-type Store = Arc<RwLock<Vec<Message>>>;
+// ── constants ──────────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
-struct AppState {
-    store: Store,
-    http: reqwest::Client,
-}
+const MAX_MESSAGES: usize = 500;
+const FLOOR_LEASE: Duration = Duration::from_secs(4);
+const TLS_CERT: &str = "/etc/pilink/certs/fullchain.pem";
+const TLS_KEY: &str = "/etc/pilink/certs/privkey.pem";
+const HTTPS_HOST: &str = "pilink.astatide.com";
+const OLLAMA_URL: &str = "http://127.0.0.1:11434";
+const OLLAMA_MODEL: &str = "qwen2:0.5b";
+const SYSTEM_PROMPT: &str = "\
+    You are a Disaster Survival Expert. Give concise, practical, step-by-step \
+    advice for emergencies. Prioritize safety, triage, shelter, water, food, \
+    first aid, and communication. If details are missing, ask 1-2 clarifying \
+    questions. Avoid speculation and do not mention being an AI.";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum Status {
-    #[serde(rename = "Safe", alias = "safe")]
-    Safe,
-    #[serde(rename = "Help", alias = "help")]
-    Help,
-    #[serde(rename = "Resource", alias = "resource")]
-    Resource,
-}
+// ── types ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Message {
     id: Uuid,
-    alias: String,
-    status: Status,
+    sender: String,
     content: String,
-    // Unix timestamp (seconds) keeps payload small and parsing cheap.
     timestamp: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct NewMessage {
-    alias: String,
-    status: Status,
+    sender: String,
     content: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct AiRequest {
     question: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct AiResponse {
     answer: String,
 }
 
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
+#[derive(Serialize)]
+struct AiHealth {
+    available: bool,
+}
+
+#[derive(Serialize)]
+struct ErrBody {
     error: String,
 }
 
-#[derive(Debug, Serialize)]
-struct OllamaGenerateRequest<'a> {
+#[derive(Serialize)]
+struct OllamaReq<'a> {
     model: &'a str,
     prompt: &'a str,
     system: &'a str,
     stream: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct OllamaGenerateResponse {
+#[derive(Deserialize)]
+struct OllamaRes {
     response: String,
 }
 
+/// Incoming WebSocket event envelope.
+#[derive(Deserialize)]
+struct WsIn {
+    #[serde(rename = "type")]
+    t: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+// ── state ──────────────────────────────────────────────────────────────────────
+
+struct WsClient {
+    tx: mpsc::UnboundedSender<String>,
+}
+
+struct FloorHolder {
+    id: Uuid,
+    name: String,
+    deadline: Instant,
+}
+
+struct VoiceState {
+    participants: HashMap<Uuid, String>, // id → display name
+    floor: Option<FloorHolder>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    msgs: Arc<RwLock<Vec<Message>>>,
+    clients: Arc<RwLock<HashMap<Uuid, WsClient>>>,
+    voice: Arc<RwLock<VoiceState>>,
+    http: reqwest::Client,
+}
+
+// ── helpers ────────────────────────────────────────────────────────────────────
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn ev(t: &str, p: Value) -> String {
+    serde_json::to_string(&json!({"type": t, "payload": p})).unwrap()
+}
+
+fn ev0(t: &str) -> String {
+    serde_json::to_string(&json!({"type": t})).unwrap()
+}
+
+async fn broadcast(clients: &RwLock<HashMap<Uuid, WsClient>>, msg: &str) {
+    for c in clients.read().await.values() {
+        let _ = c.tx.send(msg.into());
+    }
+}
+
+async fn unicast(clients: &RwLock<HashMap<Uuid, WsClient>>, id: Uuid, msg: &str) {
+    if let Some(c) = clients.read().await.get(&id) {
+        let _ = c.tx.send(msg.into());
+    }
+}
+
+async fn broadcast_floor(app: &AppState) {
+    let holder = {
+        let v = app.voice.read().await;
+        v.floor
+            .as_ref()
+            .map(|f| json!({"id": f.id, "name": f.name}))
+    };
+    broadcast(
+        &app.clients,
+        &ev("floor:state", json!({"holder": holder})),
+    )
+    .await;
+}
+
+// ── main ───────────────────────────────────────────────────────────────────────
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    const HTTP_PORT: u16 = 80;
-    const HTTPS_PORT: u16 = 443;
-    const HTTPS_HOST: &str = "pilink.astatide.com";
+    let app = AppState {
+        msgs: Arc::new(RwLock::new(Vec::new())),
+        clients: Arc::new(RwLock::new(HashMap::new())),
+        voice: Arc::new(RwLock::new(VoiceState {
+            participants: HashMap::new(),
+            floor: None,
+        })),
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("http client"),
+    };
 
-    const TLS_CERT: &str = "/etc/pilink/certs/fullchain.pem";
-    const TLS_KEY: &str = "/etc/pilink/certs/privkey.pem";
+    // Background: expire floor lease every second.
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let expired = {
+                    let v = app.voice.read().await;
+                    v.floor
+                        .as_ref()
+                        .map_or(false, |f| f.deadline < Instant::now())
+                };
+                if expired {
+                    app.voice.write().await.floor = None;
+                    broadcast_floor(&app).await;
+                }
+            }
+        });
+    }
 
-    let store: Store = Arc::new(RwLock::new(Vec::new()));
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(12))
-        .build()
-        .expect("http client build failed");
+    let spa = ServeDir::new("dist").not_found_service(ServeFile::new("dist/index.html"));
 
-    let state = AppState { store, http };
-
-    // Serve React/Tailwind build from ./dist; unknown paths fall back to index.html (SPA routing).
-    let static_service = ServeDir::new("dist").not_found_service(ServeFile::new("dist/index.html"));
-
-    let app_https = Router::new()
+    let router = Router::new()
         .route("/health", get(health))
-        .route("/api/posts", get(get_posts).post(create_post))
-        .route("/api/ai", axum::routing::post(ai))
-        .with_state(state)
-        .nest_service("/", static_service);
+        .route("/api/messages", get(get_msgs).post(post_msg))
+        .route("/api/messages/clear", post(clear_msgs))
+        .route("/api/messages/:id", delete(del_msg))
+        .route("/api/ai", post(ai))
+        .route("/api/ai/health", get(ai_health))
+        .route("/api/ws", get(ws_upgrade))
+        .with_state(app)
+        .fallback_service(spa);
 
-    // HTTP listener exists only to redirect users into HTTPS.
-    // Important for mobile browsers, and avoids mic permission issues on http://.
-    let app_http = Router::new().fallback(move |uri: axum::http::Uri| async move {
-        let pq = uri
-            .path_and_query()
-            .map(|x| x.as_str())
-            .unwrap_or("/");
-        Redirect::permanent(&format!("https://{HTTPS_HOST}{pq}"))
-    });
+    // If TLS certs exist → production (HTTPS :443 + HTTP redirect :80).
+    // Otherwise → dev mode (HTTP :3000, proxied by Vite).
+    if std::path::Path::new(TLS_CERT).exists() {
+        eprintln!("[pilink] https://{HTTPS_HOST} (:443 + :80 redirect)");
 
-    let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(TLS_CERT, TLS_KEY)
-        .await
-        .expect("failed to load TLS cert/key");
-
-    let http_listener = tokio::net::TcpListener::bind(("0.0.0.0", HTTP_PORT))
-        .await
-        .expect("bind http failed");
-
-    let https_addr = std::net::SocketAddr::from(([0, 0, 0, 0], HTTPS_PORT));
-
-    // Run both servers concurrently.
-    let http_task = tokio::spawn(async move {
-        axum::serve(http_listener, app_http)
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(TLS_CERT, TLS_KEY)
             .await
-            .expect("http server failed")
-    });
+            .expect("load TLS certs");
 
-    let https_task = tokio::spawn(async move {
-        axum_server::bind_rustls(https_addr, tls)
-            .serve(app_https.into_make_service())
+        let redirect = Router::new().fallback(|uri: axum::http::Uri| async move {
+            let pq = uri.path_and_query().map(|v| v.as_str()).unwrap_or("/");
+            Redirect::permanent(&format!("https://{HTTPS_HOST}{pq}"))
+        });
+
+        let h80 = tokio::spawn(async move {
+            let l = tokio::net::TcpListener::bind(("0.0.0.0", 80u16))
+                .await
+                .expect("bind :80");
+            axum::serve(l, redirect).await.ok();
+        });
+
+        let h443 = tokio::spawn(async move {
+            let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 443u16));
+            axum_server::bind_rustls(addr, tls)
+                .serve(router.into_make_service())
+                .await
+                .ok();
+        });
+
+        let _ = tokio::join!(h80, h443);
+    } else {
+        eprintln!("[pilink] dev mode → http://127.0.0.1:3000");
+        let l = tokio::net::TcpListener::bind(("0.0.0.0", 3000u16))
             .await
-            .expect("https server failed")
-    });
-
-    let _ = tokio::join!(http_task, https_task);
+            .expect("bind :3000");
+        axum::serve(l, router).await.ok();
+    }
 }
 
-async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+// ── HTTP handlers ──────────────────────────────────────────────────────────────
+
+async fn health() -> &'static str {
+    "ok"
 }
 
-async fn get_posts(State(state): State<AppState>) -> impl IntoResponse {
-    // Async read lock yields if a writer is active; clone to release lock quickly.
-    let messages = state.store.read().await.clone();
-    Json(messages)
+async fn get_msgs(State(app): State<AppState>) -> Json<Vec<Message>> {
+    Json(app.msgs.read().await.clone())
 }
 
-async fn create_post(
-    State(state): State<AppState>,
+async fn post_msg(
+    State(app): State<AppState>,
     Json(input): Json<NewMessage>,
 ) -> impl IntoResponse {
     let msg = Message {
         id: Uuid::new_v4(),
-        alias: input.alias,
-        status: input.status,
-        content: input.content,
-        timestamp: now_unix_secs(),
+        sender: input.sender.chars().take(32).collect(),
+        content: input.content.chars().take(600).collect(),
+        timestamp: now(),
     };
-
-    // Async write lock ensures concurrent POSTs serialize safely.
-    state.store.write().await.push(msg.clone());
-
+    {
+        let mut s = app.msgs.write().await;
+        s.push(msg.clone());
+        let excess = s.len().saturating_sub(MAX_MESSAGES);
+        if excess > 0 { s.drain(..excess); }
+    }
+    broadcast(
+        &app.clients,
+        &ev("message:new", serde_json::to_value(&msg).unwrap()),
+    )
+    .await;
     (StatusCode::CREATED, Json(msg))
 }
 
-async fn ai(State(state): State<AppState>, Json(req): Json<AiRequest>) -> impl IntoResponse {
-    let question = req.question.trim();
-    if question.is_empty() {
+async fn del_msg(State(app): State<AppState>, Path(id): Path<Uuid>) -> StatusCode {
+    let found = {
+        let mut s = app.msgs.write().await;
+        let before = s.len();
+        s.retain(|m| m.id != id);
+        s.len() < before
+    };
+    if found {
+        broadcast(
+            &app.clients,
+            &ev("message:delete", json!({"id": id})),
+        )
+        .await;
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+async fn clear_msgs(State(app): State<AppState>) -> StatusCode {
+    app.msgs.write().await.clear();
+    broadcast(&app.clients, &ev0("chat:clear")).await;
+    StatusCode::OK
+}
+
+async fn ai(State(app): State<AppState>, Json(req): Json<AiRequest>) -> impl IntoResponse {
+    let q = req.question.trim().to_string();
+    if q.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "question is required".to_string(),
+            Json(ErrBody {
+                error: "question required".into(),
             }),
         )
             .into_response();
     }
 
-    // Keep the system prompt short and directive to reduce token usage.
-    const SYSTEM: &str = "You are a Disaster Survival Expert. Give concise, practical, step-by-step advice for emergencies. Prioritize safety, triage, shelter, water, food, first aid, and communication. If details are missing, ask 1-2 clarifying questions. Avoid speculation and do not mention being an AI.";
-
-    let payload = OllamaGenerateRequest {
-        model: "qwen2:0.5b",
-        prompt: question,
-        system: SYSTEM,
+    let body = OllamaReq {
+        model: OLLAMA_MODEL,
+        prompt: &q,
+        system: SYSTEM_PROMPT,
         stream: false,
     };
 
-    // Async HTTP call to local Ollama; awaits without blocking the runtime.
-    let res = match state
+    let res = match app
         .http
-        .post("http://127.0.0.1:11434/api/generate")
-        .json(&payload)
+        .post(format!("{OLLAMA_URL}/api/generate"))
+        .json(&body)
         .send()
         .await
     {
@@ -204,49 +340,305 @@ async fn ai(State(state): State<AppState>, Json(req): Json<AiRequest>) -> impl I
         Err(e) => {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
+                Json(ErrBody {
                     error: format!("ollama unreachable: {e}"),
                 }),
             )
-                .into_response();
+                .into_response()
         }
     };
 
     if !res.status().is_success() {
         return (
             StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse {
-                error: format!("ollama error status: {}", res.status()),
+            Json(ErrBody {
+                error: format!("ollama status {}", res.status()),
             }),
         )
             .into_response();
     }
 
-    let body: OllamaGenerateResponse = match res.json().await {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!("ollama response parse error: {e}"),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    (
-        StatusCode::OK,
-        Json(AiResponse {
-            answer: body.response,
-        }),
-    )
-        .into_response()
+    match res.json::<OllamaRes>().await {
+        Ok(o) => (StatusCode::OK, Json(AiResponse { answer: o.response })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrBody {
+                error: format!("parse: {e}"),
+            }),
+        )
+            .into_response(),
+    }
 }
 
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+async fn ai_health(State(app): State<AppState>) -> Json<AiHealth> {
+    let available = app
+        .http
+        .get(format!("{OLLAMA_URL}/"))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    Json(AiHealth { available })
+}
+
+// ── WebSocket ──────────────────────────────────────────────────────────────────
+
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(app): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| ws_session(socket, app))
+}
+
+/// One WebSocket session. Splits into a send task (channel → WS) and a receive
+/// loop (WS → event handler). Cleans up voice/floor state on disconnect.
+async fn ws_session(socket: WebSocket, app: AppState) {
+    let (sink, mut stream) = socket.split();
+    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    let cid = Uuid::new_v4();
+
+    // Register client.
+    app.clients
+        .write()
+        .await
+        .insert(cid, WsClient { tx: tx.clone() });
+
+    // Queue initial state through the channel (send task drains these first).
+    let _ = tx.send(ev("self:id", json!({"id": cid})));
+    {
+        let m = app.msgs.read().await;
+        let _ = tx.send(ev("history", serde_json::to_value(&*m).unwrap()));
+    }
+    {
+        let v = app.voice.read().await;
+        let peers: Vec<Value> = v
+            .participants
+            .iter()
+            .map(|(i, n)| json!({"id": i, "name": n}))
+            .collect();
+        let _ = tx.send(ev("voice:peers", json!(peers)));
+        let holder = v
+            .floor
+            .as_ref()
+            .map(|f| json!({"id": f.id, "name": f.name}));
+        let _ = tx.send(ev("floor:state", json!({"holder": holder})));
+    }
+
+    // Task: drain channel → WebSocket sink.
+    let mut send_task = tokio::spawn(async move {
+        let mut rx = rx;
+        let mut sink = sink;
+        while let Some(msg) = rx.recv().await {
+            if sink.send(WsMsg::Text(msg)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Task: read WebSocket → event handler.
+    let app2 = app.clone();
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(frame)) = stream.next().await {
+            match frame {
+                WsMsg::Text(txt) => {
+                    if let Ok(incoming) = serde_json::from_str::<WsIn>(&txt) {
+                        handle_ws_event(&app2, cid, incoming).await;
+                    }
+                }
+                WsMsg::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    // When either task ends, cancel the other.
+    tokio::select! {
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
+    }
+
+    // ── disconnect cleanup ─────────────────────────────────────────────────
+    app.clients.write().await.remove(&cid);
+
+    let was_in_voice = {
+        let mut v = app.voice.write().await;
+        let was = v.participants.remove(&cid).is_some();
+        if was && v.floor.as_ref().map(|f| f.id) == Some(cid) {
+            v.floor = None;
+        }
+        was
+    };
+    if was_in_voice {
+        broadcast(&app.clients, &ev("voice:leave", json!({"id": cid}))).await;
+        broadcast_floor(&app).await;
+    }
+}
+
+/// Dispatch a single incoming WS event.
+async fn handle_ws_event(app: &AppState, cid: Uuid, e: WsIn) {
+    let p = &e.payload;
+
+    match e.t.as_str() {
+        // ── chat ───────────────────────────────────────────────────────────
+        "message:send" => {
+            let sender = p.get("sender").and_then(|v| v.as_str()).unwrap_or_default();
+            let content = p.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+            if sender.is_empty() || content.is_empty() {
+                return;
+            }
+            let msg = Message {
+                id: Uuid::new_v4(),
+                sender: sender.chars().take(32).collect(),
+                content: content.chars().take(600).collect(),
+                timestamp: now(),
+            };
+            {
+                let mut s = app.msgs.write().await;
+                s.push(msg.clone());
+                let excess = s.len().saturating_sub(MAX_MESSAGES);
+                if excess > 0 { s.drain(..excess); }
+            }
+            broadcast(
+                &app.clients,
+                &ev("message:new", serde_json::to_value(&msg).unwrap()),
+            )
+            .await;
+        }
+
+        "message:delete" => {
+            let Some(id) = p
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Uuid>().ok())
+            else {
+                return;
+            };
+            let found = {
+                let mut s = app.msgs.write().await;
+                let n = s.len();
+                s.retain(|m| m.id != id);
+                s.len() < n
+            };
+            if found {
+                broadcast(&app.clients, &ev("message:delete", json!({"id": id}))).await;
+            }
+        }
+
+        "chat:clear" => {
+            app.msgs.write().await.clear();
+            broadcast(&app.clients, &ev0("chat:clear")).await;
+        }
+
+        // ── voice presence ─────────────────────────────────────────────────
+        "voice:join" => {
+            let name = p
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if name.is_empty() {
+                return;
+            }
+            let existing: Vec<Value>;
+            {
+                let mut v = app.voice.write().await;
+                if v.participants.contains_key(&cid) {
+                    return;
+                }
+                // Snapshot existing peers *before* inserting self.
+                existing = v
+                    .participants
+                    .iter()
+                    .map(|(i, n)| json!({"id": i, "name": n}))
+                    .collect();
+                v.participants.insert(cid, name.clone());
+            }
+            // Tell the joiner who else is in channel (they create WebRTC offers).
+            unicast(&app.clients, cid, &ev("voice:joined", json!(existing))).await;
+            // Tell everyone (including joiner) about the new participant.
+            broadcast(
+                &app.clients,
+                &ev("voice:join", json!({"id": cid, "name": name})),
+            )
+            .await;
+        }
+
+        "voice:leave" => {
+            let removed = {
+                let mut v = app.voice.write().await;
+                let r = v.participants.remove(&cid).is_some();
+                if r && v.floor.as_ref().map(|f| f.id) == Some(cid) {
+                    v.floor = None;
+                }
+                r
+            };
+            if removed {
+                broadcast(&app.clients, &ev("voice:leave", json!({"id": cid}))).await;
+                broadcast_floor(app).await;
+            }
+        }
+
+        // ── floor control ──────────────────────────────────────────────────
+        "floor:request" => {
+            let mut v = app.voice.write().await;
+            let Some(name) = v.participants.get(&cid).cloned() else {
+                return;
+            };
+            if v.floor.is_none() {
+                v.floor = Some(FloorHolder {
+                    id: cid,
+                    name,
+                    deadline: Instant::now() + FLOOR_LEASE,
+                });
+                drop(v);
+                broadcast_floor(app).await;
+            } else {
+                drop(v);
+                unicast(&app.clients, cid, &ev0("floor:denied")).await;
+            }
+        }
+
+        "floor:release" => {
+            let mut v = app.voice.write().await;
+            if v.floor.as_ref().map(|f| f.id) == Some(cid) {
+                v.floor = None;
+                drop(v);
+                broadcast_floor(app).await;
+            }
+        }
+
+        "floor:heartbeat" => {
+            let mut v = app.voice.write().await;
+            if let Some(ref mut f) = v.floor {
+                if f.id == cid {
+                    f.deadline = Instant::now() + FLOOR_LEASE;
+                }
+            }
+        }
+
+        // ── WebRTC signaling relay ─────────────────────────────────────────
+        t @ ("webrtc:offer" | "webrtc:answer" | "webrtc:ice") => {
+            let Some(to) = p
+                .get("to")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Uuid>().ok())
+            else {
+                return;
+            };
+            // Relay payload, replacing "to" with "from".
+            let mut relay = serde_json::Map::new();
+            if let Value::Object(map) = p {
+                for (k, v) in map {
+                    if k != "to" {
+                        relay.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            relay.insert("from".into(), json!(cid));
+            unicast(&app.clients, to, &ev(t, Value::Object(relay))).await;
+        }
+
+        _ => {}
+    }
 }
